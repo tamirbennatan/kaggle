@@ -1,0 +1,915 @@
+---
+title: "Managing and Exploring Many Models using `tidyr`, `purrr` and `broom`"
+output:
+  html_document:
+    fig_height: 6
+    fig_width: 8
+    messages: no
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+```{R}
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(purrr)
+library(reshape2)
+library(stringr)
+library(lubridate)
+library(forecast)
+library(ggforce)
+library(broom)
+library(data.table)
+library(gridExtra)
+library(prophet)
+```
+
+## 1. Introduction
+
+At the 2016 _PlotCon_ data visualization conference, Hadley Wickham - chief scientist at RStudio and the mastermind behind [my favorite R packages](https://www.tidyverse.org/) - gave [a great talk](https://www.youtube.com/watch?v=cU0-NrUxRw4) about how to use a simple idea of _list columns_ and some tools from functional programming to manage and explore many models at once within the `tidyverse` framework. 
+
+What I like about this talk - and the proposed technique (which I use in this notebook) - is that Wickham shows how to muse _modeling as a form of data exploration_. From my experience, statistical modeling does not usually help you discover a new dimension or property in your data. By definition, statistical models are limited to the data and features you train them on, and since their behavior is so closely tied to your initial assumptions, they rarely illuminate a new aspect of your data that you did not already know about.  
+
+Wickham proposes a simple but powerful technique to use modeling as a tool to _understand and learn about your data_ - not only as a means to form predictions or formalize statistical properties. If one is interested in learning about the behavior of different groups of data  within a dataset (in this case, the groups are different Wikipedia pages), Whickham suggests to create a dataframe where there is one row per group, and all the data associated with that group is stored in a column of dataframes. The result is a dataframe of dataframes. Then, one can apply modeling techniques to each group in parrallel, and use corresponding measures of fitness or properties of the parameters to learn about each group. 
+
+In this notebook, I use this technique to fit statistical models to the time series of each Wikipedia article in parralel. I then use the properties of these models to try and learn about the time series themselves. 
+
+Note: I do not think that this approach is the only or best way to learn about the properties of many time series at once. I do think it is an interesting approach, and a technique that in any setting in which you want to model your data based on the group each data point belongs to. 
+
+## 1. Wikipedia Data - a first look
+
+First, I'll need to load the data, and reshape it so that it's easier to work with. 
+
+
+#### 1.1 Loading data
+
+```{R}
+# Training data
+data <- read.csv("data/train_2.csv")
+```
+
+#### 1.2 Making the data Tidy
+
+At first glance of the data:
+
+```{R}
+head(data)
+```
+
+
+We can see that each row contains the name of the Wikipedia article under the `Page` column, and the remaining 803 columns are page views for that page on different dates.
+
+The first step whenever I perform an analysis with the [tidyverse stack](https://www.tidyverse.org/) is convert the data into a **tidy** format, meaning that:
+
+1. Every column represents one variable
+2. Every row represents one observations. 
+
+Here, the true varaibles in this data are:
+
+- Page name
+- Date
+- Number of Views
+
+And a single observation is the number of page views recorded for a single page on a single day.
+
+Using the `reshape2` package, we can convert the data so that it has this exact form:
+
+
+```{R}
+# convert to long format. 
+data <- data %>%
+      melt(id.vars = "Page") %>%
+      rename(date = variable, 
+             views = value)
+
+head(data)
+```
+
+Now, our dataframe of ~145,000 rows and ~800 columns has been reshaped to a dataframe of ~116,000,000 rows and 3 columns.
+
+#### 1.3 Consolidating data types
+
+The next step is to make sure each of the columns are of the right data type. 
+
+```{R}
+str(data)
+```
+
+`Page` is a factor, and `views` is an integer datatype, which makes sense. `date` is stored as a factor, which is not right - really we want to store it as a native date format. 
+
+To do this, we'll have to remove the leading `X` characters at the begining of each value. Later, I will cast these strings to  native `date` datatypes using the function `lubridate::ymd()` function - but for now I will leave it as strings - for reasons I will discuss in a minute. 
+
+```{R}
+data <- data %>%
+      mutate(date = str_replace(pattern = "X", replacement = "", date))
+
+head(data)
+```
+
+
+#### 1.4 Missing values
+
+Just so we're aware - how many values are missing? 
+
+
+```{R}
+sum(is.na(data$views)) / nrow(data)
+```
+
+Around 6 percent of the view counts are missing. We can't be sure if this means that there were zero views for that page on that day, or if the view count data is simply missing for that day. 
+
+Another relevent question is the proportion of of series which have _any_ missing values:
+
+```{R}
+# Look at the proportion of wikipedia pages that have one or more missing values. 
+data %>% 
+      group_by(Page) %>%
+      summarize(num.missing = sum(is.na(views)) ) %>%
+      mutate(any.missing = num.missing > 0) %>%
+      .$any.missing %>% 
+      mean()
+```
+
+So 20% of the Wikipedia page counts have at least one missing value. This is a little disconcerting, as some of the more classical forecasting methods (ARIMA, state space models) do not handle missing values gracefully. 
+
+For forecasting purpose, I might have to resort to Facebook's `Prophet` package, which claims to be "robust to missing data". 
+
+
+
+## 2. Nesting `dataframes` - a `dataframe` for every page. 
+
+Now, as discussed earlier, we transform the dataset into a dataframe such that every page populats one row, and the corresponding data is stored in a list column. This is a three-liner with the `tidyr::nest()` function. 
+
+#### 2.1 Using the `tidyr::nest()` function.
+
+**A word of warning** - creating list columns with the `tidyr::nest()` function is very slow if if one of your columns is of type `Date` (see [this Github issue for more details](https://github.com/tidyverse/tidyr/issues/369)). As such, I will on
+
+```{R}
+# dataframes within dataframes... dataframeception!
+nested = data %>%
+      group_by(Page) %>%
+      nest()
+```
+
+```{R}
+# remove the unnested data to free up some memory
+rm(data)
+```
+
+Now, taking a look at our nested dataframe, we can see that there is one row per Wikipedia page, and a column called `data` which is populated with a tibble (well behaved dataframe) containing the data fro that Wikipedia page:
+
+```{R}
+# first five wikipedia pages
+head(nested)
+```
+
+```{R}
+# isolating the first page in the dataset
+first_page = nested[1,]
+
+# taking a look at the first entry fo the column `data`
+first_page$data
+```
+
+#### 2.2 Casting date types
+
+Now that we have a properly neste dataframe, we can cast the `date` column in every nested dataframe to the correct datatype. 
+
+Again, the reason I didn't do this upfront is because the `nest()` function is _very_ slow when one of the columns you are nesting is a date type. 
+
+To do this type cast, I'll write small function that casts the data type of the `date` column in a dataframe, and then map it over all the nested dataframe using `purrr::map()`:
+
+```{R}
+# quick function to cast string dates to native dates
+cast_date <- function(df){
+      df %>% mutate(date = ymd(date))     
+}
+```
+
+```{R}
+# applying this transformation to each of the nested dataframes by
+# modifying the `data` column, using `dplyr::mutate()`:
+nested = nested %>%
+      mutate(data = map(.f = cast_date, .x = data))
+
+# isolating the first page in the dataset
+first_page = nested[1,]
+```
+
+
+## 3. Before we start modeling... what's the data look like? 
+
+The point of this notebook is to show how to use modeling for data exploration. But even so - I can't jump into modeling without knowing what the data looks like at the least.
+
+I'm most interested in identifying structure in the data that will influence my choices of parameters in models to come, or which models to use. For example, I'd be interested in identifying are any seasonal structure at a human interval - such as weekly or annual seasonality - which I've come to expect with any time series data relating to online activity. This is because if I choose to fit a Seasonal ARIMA model to each time series, or perform some sort of time series decomposition, I will need to know the periodicity of the seasonality, if any. I'd also be interested in identifying any outliers or extreme values. This may motivate me to transform my data in some way, or use models that are robust to extreme values. 
+
+#### 3.1 A first glance
+
+So far, our data consists of one row per Wikipedia page, with a column containing the data for each page:
+
+
+```{R}
+head(nested)
+```
+
+Each nested tibble (the data associated with a page) consists of the view count over the dates in the dataset:
+
+```{R}
+nested[1,] %>%
+      .$data %>%
+      .[[1]] %>%
+      head()
+```
+
+Some interesting questions are:
+
+1. What information is stored in those convoluted page names?
+2. What seasonality can we observe in the page views?
+3. How variable are the page views across the different pages?
+4. How many pages have very extreme page view counts? 
+
+
+#### 3.2 Disecting the page names
+
+Taking a closer look at a sample of 30 page names, we can see that there is a lot of information stored in those names...
+
+```{R}
+set.seed(1)
+nested %>%
+      sample_n(size = 30) %>%
+      select(Page)
+
+```
+
+Some of the things I've noticed:
+
+1. It looks like the the begining of the name is the Wikipedia page's title - spaces seperated by underscores. I see values of `Page` that start with strings like *Mouammar_Kadhafi* and *Masacre_de_la_Escuela_Secundaria_de_Columbine* (an article about the Columbine shooting in Spanish).
+2. After the article title, there is a two letter code for the language (_ja, de, fr, en_, etc), followed by a period. 
+3. The end of the page name shows the client the views were made on (e.g. _mobile, web, all-access_)
+4. The very last words of the page name (from this sample) are ither *all-agents* or *spider*. Not sure what this is. 
+5. I noticed that one of the domains in this sample is of the form *www.mediawiki.org*. I wonder how many domains are in this dataset. 
+
+The first thing I'd be interested in is extracting the language of the article. Studying the distribution of vies over different languages is as close as we can get to studying the viewing behavior of different geographic regions, which is an interesting venture. 
+
+Using a simple regular expression, I can extract the two letters that precede the first period in the page - in hopes that the pattern I've seen in this sample extend to the rest of the data. 
+
+```{R}
+nested = nested %>%
+      # a positive lookahead - extract two letters preceding first period. 
+      mutate(language = str_match(pattern = regex("[a-z][a-z](?=\\.)"), Page))
+
+```
+
+```{R}
+nested %>%
+      count(language, sort = TRUE) %>%
+      rename(count = n) %>%
+      mutate(cumulative.proportion = cumsum(count)/sum(count)) %>%
+      mutate(language = ifelse(cumulative.proportion < .9, language, "other")) %>%
+      group_by(language) %>%
+      summarize(count = sum(count)) %>%
+      ungroup() %>%
+      mutate(proportion = count/sum(count)) %>%
+      ggplot(aes(x = language, y = proportion, fill = language)) +
+      geom_col() +
+      ylab("Proportion of pages with hypothesized language") + 
+      theme(legend.position = "")
+
+```
+
+Using this extraction method, we can see that around 90% of the pages are in the languages:
+
+1. German (de)
+2. English (en)
+3. Spanish (es)
+4. French (fr)
+5. Japanese (ja)
+6. Russian (ru)
+7. Chinese (zh)
+
+The remaining 10 percent are "other". These could indeed be articles in different languges than the 7 listed above, or it could be that my extraction regex doesn't work correctly on the entire dataset. 
+
+As such, I'll encode the languages not in the list above as *other*, and tread carefully when analyzing data of this class in the future:
+
+```{R}
+nested = nested %>%
+      mutate(language = ifelse(
+            language %in% c("de", "en", "es", "fr", "ja", "ru", "zh"),
+            language, 
+            "other"))
+```
+
+
+Now, extracting the domains by extracting the first character sequence that is surrounded by two periods:
+```{R}
+nested %>%
+      mutate(domain = str_match(pattern = regex("(?<=\\.)[^\\.]+(?=\\.)"), Page)) %>%
+      count(domain, sort = TRUE) %>%
+      mutate(proportion = round(n/sum(n),3)) %>%
+      mutate(cumulative.proportion = cumsum(proportion))
+
+```
+
+This shows that, according to the pattern I've defined, 94.4% of the data comes from the domains *wikipedia*, *midiawiki* or *wikimedia*. 
+
+I also noticed a page name of the form *jpg_commons.mediawiki.org*. My pattern would miss that this is a special case of a *mediawiki* domain, and instead call it a *jpg_commons* domain. 
+
+To try and catch these weird cases, I'll set the domain of the page to *mediawiki* if the character sequence "mediawiki" appears in the value of the `Page` column. Same goes for *wikipedia* and *wikimedia*
+
+```{R}
+nested = nested %>%
+      mutate(domain = case_when(
+            str_detect(pattern = "mediawiki", Page) ~ "mediawiki",
+            str_detect(pattern = "wikimedia", Page) ~ "wikimedia",
+            str_detect(pattern = "wikipedia", Page) ~ "wikipedia", 
+            TRUE ~ "other"
+            )
+      )
+```
+
+```{R}
+nested %>%
+      group_by(domain) %>%
+      summarize(proportion = n()/nrow(nested)) 
+```
+
+Indeed, all page names contain the strings *mediawiki*, *wikimedia* or *wikipedia*. 
+
+From the values of the `Page` column, I can extract the Wikipedia article name. 
+
+It truns out that the way in which the article name is encoded into the values of the `Page` column depends on the domain of the page. I first saw this in [Heads or Tail's outstanding notebook](https://www.kaggle.com/headsortails/wiki-traffic-forecast-exploration-wtf-eda) - and so all the kuddos to him/her for finding this concrete pattern. 
+
+```{R}
+# Extract the article name from the `Page` column
+nested = nested %>%
+      mutate(article = case_when(
+            domain == "wikipedia" ~ str_match(Page, pattern = regex(".+(?=_[a-z][a-z].wikipedia.org_)")), 
+            domain == "wikimedia" ~ str_match(Page, pattern = regex(".+(?=_commons.wikimedia.org)")),
+            domain == "mediawiki" ~ str_match(Page, pattern = regex(".+(?=_www.mediawiki.org_)"))
+            )
+      )
+
+# a small sample of `Page` and `article` values
+set.seed(1)
+nested %>%
+      sample_n(10) %>%
+      select(Page, article)
+```
+
+This seems to be working well. Now we can compare articles across different languages. 
+
+#### 3.3 Getting a sense for seasonality
+
+If there is clear seasonality in the data, it would be important to identify it early. Looking at the first time series in the `nested` dataframe as an example:
+
+```{R}
+# isolate the first page
+first_page = nested[1,]
+
+# a function to plot a simple time series plot: to avoid re-writing code. 
+plot_series <- function(df, title = NULL){
+      df %>%
+            ggplot(aes(x = date, y = views, color = views)) + 
+            geom_point() + 
+            geom_line() + 
+            labs(title = paste(title, "series", sep = " ")) +
+            theme(legend.position = "")
+}
+```
+```{R}
+# plot the series of the first page
+first_page %>%
+      .$data %>%
+      .[[1]] %>%
+      plot_series(title = first_page$article)
+```
+
+It's hard to see any structure in this series - mostly because there's one very high value at around May 2016. Perhaps if we use a log-scale for the y-axis, we can see some more structure
+```{R}
+# a function to plot a simple time series plot on a log scale for the y-axis 
+plot_series_log <- function(df, title = NULL){
+      df %>%
+            ggplot(aes(x = date, y = views, color = views)) + 
+            geom_point() + 
+            geom_line() + 
+            labs(title = paste(title, "series", sep = " ")) + 
+            scale_y_log10() + 
+            theme(legend.position = "")
+}
+
+
+first_page %>%
+      .$data %>%
+      .[[1]] %>%
+      plot_series_log(title = first_page$article) + 
+      facet_zoom(xy = dplyr::between(date, as.Date("2016-06-01"), as.Date("2016-07-01")), horizontal = FALSE, zoom.size = .6)
+```
+
+Indeed, after taking a log scale the data becomes much more visible. Perhaps this is a step I should apply to all series - to mitigate the effect of large spikes.
+
+If any seasonality is present in this data, its not immediately present. Looking at the values of the sample autocorrelation function for this first time series:
+
+```{R}
+first_page %>%
+      .$data %>%
+      .[[1]] %>%
+      .$views %>%
+      acf()
+```
+
+Again, it doesn't look like there is strong seasonality in this series. This could be an artifact of the particular series, however. This wikipedia page doesn't get very much traffic - and so a natural seasonal variation may not appear in this data. 
+
+Perhaps looking at a more popular page will be more meaningful. To get a feel for how popular each page is, I'll store average, median, and standard deviation of the daily veiws for each page in the `nested` dataframe:
+
+To do so without unnesting the nested data in `nested`, I'll use a higher order function, `extract_metric`. This function takes in a nested dataframe `d`, and a function used to calculalate a metric `metric`, and returns the that function applied to the `views` column of the nested dataset. I can then map this function with `metric` euqual to `mean`, `median` and `function(l) sqrt(var(l)` to get the average, median and standard deviation of of the `views` in each nested dataframe. 
+
+```{R}
+# apply an arbitrary metrix on the `views` column of of the nested data
+extract_metric <- function(d, metric, ...){
+      metric(d$views, ...)
+}
+
+# map this H.O.F to get the average, median and standard deviation of views
+nested = nested %>% 
+      mutate(average.views = map_dbl(.f = extract_metric, .x = data, metric = mean, na.rm = TRUE), 
+             median.views = map_dbl(.f = extract_metric, .x = data, metric = median, na.rm = TRUE), 
+             stddev.views = map_dbl(.f = extract_metric, .x = data, metric = function(l) sqrt(var(l, na.rm = TRUE))))
+
+```
+
+Now we have the mean, median and standard deviation of the views stored in `nested`. Pretty nice, eh! 
+
+```{R}
+nested %>%
+      ggplot(aes(x = average.views, fill = language)) + 
+      geom_density(position = "stack") + 
+      scale_x_log10() +
+      xlab("Average daily views (log scale)")
+```
+
+```{R}
+nested %>%
+      ggplot(aes(x = median.views, fill = language)) + 
+      geom_density(position = "stack") + 
+      scale_x_log10() +
+      xlab("Median daily views (log scale)")
+
+```
+
+```{R}
+nested %>%
+      ggplot(aes(x = stddev.views, fill = language)) + 
+      geom_density(position = "stack") + 
+      scale_x_log10() +
+      xlab("Standard deviation of daily views (log scale)")
+
+```
+
+
+Now, arrnging the views in terms of decending average view count:
+
+```{R}
+nested %>%
+      arrange(desc(average.views))
+```
+
+That's not surprising - the Wikipeda Main page gets the highest average daily view count (21,415,015.46/day). Perhaps this page will have more apparent seasonality. 
+
+```{R}
+nested %>%
+      filter(Page == "Main_Page_en.wikipedia.org_all-access_all-agents") %>%
+      .$data %>%
+      .[[1]] %>%
+      plot_series(title = "Main Page") + 
+      facet_zoom(xy = dplyr::between(date, as.Date("2016-02-01"), as.Date("2016-03-01")), horizontal = FALSE, zoom.size = .5)
+
+```
+
+Two things here are interesting. First: we can indeed see some more regular seasonality in the main page. It looks like there is a periodicity of 7 days - presumably for the days of the week. 
+
+The second interesting thing is that there is a hugh Spike in web vies for about a month starting in August 2016. What could this be? And more importanty, how can I detect similar spikes in the 145K other time series in this dataset? 
+
+What this shows me is that some of the series have clear seasonality (e.g. the Wikipedia main page), while others do not (the first page in the nested dataframe). In this followin sections, I will try and use automatic modeling methods to help identify which series have strong seasonality, and which don't. 
+
+
+## 4. Modeling linear trend
+
+
+Now for the fun stuff - mapping modeleling functions onto the nested data. As a first step, I will try and model the trend of the view count using simple linear regression. Then, looking at measures of model quality such as the $R^2$, I can see which series have roughly linear trends, and which clearly dont. 
+
+To apply a linear model to each of the nested dataframes, I'll first design a function that takes in a dataframe, and applies simple linear regression onto it: 
+
+```{R}
+# a function for fitting SLR to an inptut dataframe
+apply_lm <- function(df){
+      lm(data = df, views ~ date)      
+}
+```
+
+Now, mapping this function onto each of the nested dataframes, we can get a new column, `linear_trend`, which stores linear models, fit onto each corresponding nested dataframe:
+
+```{R}
+# fit a linear model to each page
+nested = nested %>%
+      mutate(linear_trend = map(.f = apply_lm, .x = data))
+
+# isolate the first page
+first_page = nested[1,]
+```
+
+
+Now, along with a list column of the data for each page in a column, we also have a fitted linear model object stored in a seperate column for each wikipedia page:
+
+```{R}
+nested %>%
+      head() %>%
+      select(Page, data, linear_trend)
+```
+
+For example, if we wanted to see the summary of the first linear model fit:
+
+```{R}
+nested[1,] %>% .$linear_trend %>% .[[1]] %>% summary()
+```
+
+Now, it'd be interesting to store a measure of model quality for each of these linear models - namely the $R^2$ statistic. This will be helpful, as looking at each model's $R^2$ will help us highlight which Wikipedia pages exhibit clear linear trend, and which don't (this might be hard to determine otherwise - can you think of a good way to do so?)
+
+
+I'll define a function `extract_r2` - which uses the `broom` function to extract the $R^2$ of a linear model. I'll then map this function onto nested `lm` models to store the $R^2$ for each model:
+
+```{R}
+# a function for extracting only the R-squared statistics
+extract_r2 <- function(model){
+      glance(model)$r.squared
+}
+
+# map this function onto each model to store the R^2
+nested = nested %>%
+      mutate(lm.r.squared = purrr::map_dbl(.f = extract_r2, .x = linear_trend))
+
+```
+
+
+Looking at the distribution of $R^2$ across the different Wikipedia pages:
+
+```{R}
+nested %>%
+      ggplot(aes(x = lm.r.squared)) + 
+      geom_density()
+```
+
+
+Most of the time series can not be explained well by a linear model, leading to low $R^2$. 
+
+Some models have suspiciously high $R^2$ values - I suspect this is because mosto fo the data is missing, and thus a linear model can fit these sparse data more effectively. To test this hypothesis, I can plot the model with the highest $R^2$:
+
+
+```{R}
+# a funtion for plotting a time series, with a fitted linear trend line on top of it
+plot_linear_trend <- function(df, title){
+      df %>%
+            ggplot(aes(x = date, y = views, color = views)) +
+            geom_point() + 
+            geom_line() + 
+            geom_smooth(method = "lm", se = FALSE) + 
+            labs(title = title) + 
+            theme(legend.position = "")
+}
+```
+
+```{R}
+# plot the model with the highest R^2
+nested %>%
+      arrange(desc(lm.r.squared)) %>%
+      .[1,] %>%
+      mutate(chart = map2(.f = plot_linear_trend, .x = data, .y = article)) %>%
+      .$chart
+```
+
+
+Indeed - the model with the highest $R^2$ has only 2 non-missing points - and clearly two points can be fitted perfectly by a line. 
+
+But if we skip the pages with the 50 highest $R^2$ values, we can really see that these models have a roughly linear trend:
+
+
+```{R}
+nested %>%
+      arrange(desc(lm.r.squared)) %>%
+      filter(dplyr::between(row_number(), 50, 55)) %>%
+      mutate(chart = purrr::map2(.f = plot_linear_trend, .x = data, .y = article)) %>%
+      .$chart
+
+```
+
+
+Now, looking at the model with the lowest $R^2$:
+
+```{R}
+nested %>%
+      arrange(lm.r.squared) %>%
+      .[1,] %>%
+       mutate(chart = purrr::map2(.f = plot_linear_trend, .x = data, .y = article)) %>%
+      .$chart
+```
+
+We can see that this model as an $R^2$ of zero, as it's only a point - the model is underspecified, and so it cannot converge to an optimal linear fit (there are infinite straight lines that go through a point that are all equally valid regression lines). 
+
+If we skip the 24 pages with the lowest $R^2$, we can see that some models have very low $R^2$ values not because the time seiries exhibit trend that is non-linear in nature, but rather because the series have few anamolous points. 
+
+These anomolies, or spikes, lead to high residual error, decreasing the $R^2$. This is an interesting approach to identify outliers in the seiries: 
+
+
+
+```{R}
+nested %>%
+      arrange(lm.r.squared) %>%
+      filter(dplyr::between(row_number(), 25, 30)) %>%
+      mutate(chart = purrr::map2(.f = plot_linear_trend, .x = data, .y = article)) %>%
+      .$chart
+
+```
+
+Now, looking at plots of series which don't have extraordinarily high or low $R^2$, we find some series that either truly exhibit non-linear trends, resulting in low $R^2$:
+
+
+```{R}
+nested %>%
+      arrange(desc(lm.r.squared)) %>%
+      filter(dplyr::between(row_number(), 10000, 10005)) %>%
+      mutate(chart = purrr::map2(.f = plot_linear_trend, .x = data, .y = article)) %>%
+      .$chart
+
+```
+
+```{R}
+# remove the linear model column to save memory
+nested <- nested %>%
+      select(-linear_trend)
+```
+
+```{R}
+head(nested)
+
+```
+
+
+## 5. Modeling volitility and seasonality with `auto.arima`
+
+
+
+```{R}
+nested = nested %>%
+      mutate(proportion.missing = map_dbl(.f = function (df) mean(is.na(df$views)), .x = data))
+```
+
+
+```{R}
+nested %>%
+      ggplot(aes(x = proportion.missing)) + 
+      geom_density() + 
+      labs(title = "Proportion of series missing")
+```
+
+
+```{R}
+# seed for reproducability
+set.seed(1)
+# sample 100 series that have less that 15% missing values
+nested_sample = nested %>%
+      filter(proportion.missing <= .15) %>%
+      sample_n(100)
+```
+
+
+```{R}
+fit_arima <- function(df) {
+      tryCatch({
+      series = ts(df$views, frequency = 7)
+      auto.arima(series)
+      },
+      error = function(cond) {
+            NA
+      },
+      finally = {}
+      )
+}
+```
+```{R}
+nested_sample = nested_sample %>%
+      mutate(arima_model = purrr::map(.f = fit_arima, .x = data))
+```
+```{R}
+# reset `first_page` to be the first fitted sample
+first_page = nested_sample[1,]
+```
+
+```{R}
+l = nested_sample %>% .$arima_model %>%
+      .[[1]] 
+
+l$arma
+```
+
+```{R}
+extract_arima_terms <- function(model){
+     
+      # extract the coeficients as an integer vector
+      coefs = model$arma
+      
+      # Isoalte the individual parameters and strore in a small tibble
+      tmp = tibble(
+            p = coefs[1],
+            d = coefs[2],
+            q = coefs[3],
+            P = coefs[4],
+            D = coefs[5],
+            Q = coefs[6]
+      )
+      
+      # store the overall order (number of ar/ma parameters)
+      tmp <- tmp %>%
+            mutate(order = p + q + P + Q,
+            seasonal = P + Q,
+            non_seasonal = p + q)
+      
+      tmp
+            
+}
+
+first_page %>%
+      .$arima_model %>%
+      .[[1]] %>%
+      extract_arima_terms()
+```
+
+```{R}
+nested_sample = nested_sample %>%
+      mutate(arima.terms = purrr::map(.f = extract_arima_terms, .x = arima_model)) %>% 
+      unnest(arima.terms)
+```
+```{R}
+# re-store the first page
+first_page = nested_sample[1,]
+
+```
+
+
+```{R}
+nested_sample %>%
+      group_by(order) %>%
+      summarize(count = n()) %>%
+      mutate(order = factor(order)) %>%
+      ggplot(aes(x = order, y = count, fill = order)) + 
+      geom_col() + 
+      coord_flip() + 
+      theme(legend.position = "")
+
+
+```
+
+```{R}
+p1 <- nested_sample %>%
+      group_by(non_seasonal) %>%
+      summarize(count = n()) %>%
+      mutate(non_seasonal = factor(non_seasonal)) %>%
+      ggplot(aes(x = non_seasonal, y = count, fill = non_seasonal)) + 
+      geom_col() + 
+      coord_flip() + 
+      theme(legend.position = "")
+
+p2 <- nested_sample %>%
+      group_by(seasonal) %>%
+      summarize(count = n()) %>%
+      mutate(seasonal = factor(seasonal)) %>%
+      ggplot(aes(x = seasonal, y = count, fill = seasonal)) + 
+      geom_col() + 
+      coord_flip() + 
+      theme(legend.position = "")
+
+
+grid.arrange(p1,p2)
+```
+
+```{R}
+# plot the forecasts for models with 5 lowest orders
+nested_sample %>%
+      arrange(order) %>%
+      filter(row_number() <= 5) %>%
+      mutate(plot = map(.x = arima_model, .f = function(mod) plot(forecast(mod, 100))))
+```
+
+```{R}
+# plot the forecasts for models with 5 highest orders
+nested_sample %>%
+      arrange(desc(order)) %>%
+      filter(row_number() <= 5) %>%
+      mutate(plot = map(.x = arima_model, .f = function(mod) plot(forecast(mod, 100))))
+```
+
+
+```{R}
+# plot the forecasts for models with 5 highest orders
+
+apply_difference <- function(data, d){
+      tmp = data$views
+      if (d > 0){
+            for (i in 1:d){
+                  tmp = diff(tmp)
+            }
+      }
+      tmp
+}
+```
+```{R}
+
+
+nested_sample %>%
+      arrange(desc(seasonal)) %>%
+      filter(row_number() <= 5) %>%
+      mutate(acf = map2(.x = data, .y = d, .f = function(data,d) acf(apply_difference(data,d))))
+```
+
+```{R}
+nested_sample %>%
+      arrange((seasonal)) %>%
+      filter(row_number() <= 5) %>%
+      mutate(acf = map2(.x = data, .y = d, .f = function(data,d) acf(apply_difference(data,d))))
+```
+
+
+
+## 6. Forecasting with `Prophet`
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

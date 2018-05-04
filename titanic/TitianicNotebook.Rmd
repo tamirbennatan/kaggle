@@ -1,0 +1,562 @@
+---
+title: "Titanic Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Contents
+- Introduction
+- Exploration and Feature Selection
+      - Load data
+      - Load Packages
+      - Broad Trends
+      - Relationship between family and survival rate.
+      - Passenger title filling ages
+- A First Model - Logistic Regression Classifier
+      - Training and cross validation set.
+      - Define model.
+- A Second Model - Fitting Records With Missing Values.
+      - Using titles as factors.
+      - Fitting the second model. 
+- Predict and submit.
+- Next steps. 
+      
+---
+
+### Introduction
+
+In this notebook, I do some lightweight data exploration and fit a simple logistic regression classifier. I only spent a couple afternoons on this, and there is certainly more work I could do to get my accuracy up. 
+
+There are assumptions that I make early in the analysis that I later find to be false, and I gain intuition for the problem as I go. I've purposefully kept false starts in this notebook to document my though process, both for the reader and for myself, should I choose to return to this problem in the future.  
+
+### Exploration and Feature Selection
+
+#### Load data.
+```{R}
+df.train <- read.csv("data/train.csv")
+df.test <- read.csv("data/test.csv")
+```
+
+#### Load packages.
+```{R}
+suppressMessages(require(dplyr))
+suppressMessages(require(knitr))
+suppressMessages(require(ggplot2))
+suppressMessages(require(grid))
+suppressMessages(require(gridExtra))
+suppressMessages(require(reshape2))
+suppressMessages(require(stringr))
+```
+
+#### Broad trends.
+
+First, lets see how many people survived this disaster. 
+```{R}
+# number of passangers in dataset
+nrow(df.train)
+# Proportion of passangers that survived
+mean(df.train$Survived)
+```
+
+Anyone who's seen the blockbuster film _Titatnic_ will know that socioeconomic class played a role in a passanger's likelyhood of survival. I'm sure the passangers cabin class, stored in the column *Pclass*, will play an important role in this classfier. Let's take a look at the affect of class on survival ratings. 
+
+```{R}
+kable(
+      df.train %>% 
+            group_by(Pclass) %>%
+            summarize(
+                  num.passangers = n(),
+                  survival.rate = mean(Survived))
+)
+```
+
+I'd like to see how survival rates are higher amongst women and children. This might be the case if women/children were given priority in boarding the lifeboats. 
+
+```{R}
+kable(
+      df.train %>%
+            group_by(Pclass, Sex) %>%
+            summarize(
+                  num.passangers = n(),
+                  survival.rate = mean(Survived))
+)
+```
+It looks like male passengers in class 3 had it especially bad. I'll try puting an interaction term between _Pclass_ and _Sex_ in the model.
+
+Next I'll see how surivial rates varied for amongst broad age groups amongst the different classes/genders.
+```{R}
+age_group <- function(Age){
+      if(is.na(Age)){
+            return("No Age")
+      }
+      if(Age < 5) {
+            return("Young Child")
+      }
+      else if(Age < 14) {
+            return("Child")
+      }
+      else {
+            return("Adult")
+      }
+}
+```
+```{R}
+kable(
+      df.train %>%
+            filter(!is.na(Age)) %>%
+            rowwise() %>%
+            mutate(age.group = age_group(Age)) %>%
+            group_by(Pclass, Sex, age.group) %>%
+            summarise(
+                  num.passengers = n(), 
+                  survival.rate = mean(Survived)
+            ) %>%
+            arrange(desc(survival.rate))
+)
+      
+
+```
+
+ It seems that priority was given (roughly) as follows:
+ 
+ 1. Children in classes 1 and 2
+ 2. Adult women in classes 1 and 2
+ 3. Women from any class and young children (age 3 or younger) in class 3
+ 4. Adult men from class 1
+ 5. Adult men and children from class 2 and 3
+ 
+This should be taken with a grain of salt however. There are very few records of children in classes one and two, so the high survival rates amongst these groups may be misleading. 
+ 
+This exposes an issue in the data - many of the values in the _Age_ column are missing. In the training set of 891 records there are 173 records (19% ) where age is missing. 
+
+```{r}
+kable(
+      df.train %>%
+            group_by(Pclass) %>%
+            mutate(class.size = n()) %>%
+            filter(is.na(Age)) %>%
+            summarize(num.passengers = n(), class.size = first(class.size), survival.rate = mean(Survived)) %>%
+            mutate(percent.na = num.passengers/class.size)
+)
+```
+
+
+#### Relationship between family and survival rate. 
+
+- Do children have a better chance of survival if they are traveling with/without their parent(s)? 
+- Do adults have a better chance of survival if they are traveling with/without a their child(ren)? 
+- Do large families fair well? 
+- Do parents in lower class have it worse than non-parents? (for example, if they must sacrifice themselves for their kids)
+- Do women with young children have it better than women without young children? (for example, if priority was given to young children who could not be seperated from their mothers)
+
+
+##### Family size
+```{R}
+survival.rate.by.fam.size <- df.train %>%
+      mutate(family.size = SibSp + Parch + 1) %>%
+      group_by(family.size) %>%
+      summarise(num.families = n(),  survival.rate = mean(Survived))
+
+grid.arrange(
+      ggplot(data = survival.rate.by.fam.size, aes(x = family.size, y = survival.rate)) + geom_col(), 
+      ggplot(data = survival.rate.by.fam.size, aes(x = family.size, y = num.families)) + geom_col() + 
+            geom_text(aes(x = family.size, y = num.families, label = num.families, vjust = -1)),
+      ncol = 1)
+
+
+```
+
+This shows that on average, very large families do not fair well. Of the six families of 8 and the seven families of 11, none of the family members survived! That's really sad. 
+
+Lets see how family size affects survival across ticket classes.
+
+```{R}
+survival.rate.by.famsize.class <- 
+      df.train %>%
+            mutate(family.size = SibSp + Parch + 1) %>%
+            group_by(Pclass, family.size) %>%
+            summarize(num.families = n(), survival.rate = mean(Survived))
+
+g1 = ggplot(data = survival.rate.by.famsize.class, aes(x = family.size, y = survival.rate)) + geom_col() + facet_wrap(~Pclass, ncol = 1) + ggtitle("Survival rate by family size & class") + scale_x_continuous(breaks = 1:11)
+
+g2 = ggplot(data = survival.rate.by.famsize.class, aes(x = family.size, y = num.families)) + geom_col() + geom_text(aes(x = family.size, y = num.families, label = num.families, vjust = -.5)) + facet_wrap(~Pclass, ncol = 1) + ggtitle("Number of families by size & class") + scale_x_continuous(breaks = 1:11)
+
+grid.arrange(g1, g2, ncol = 2)
+```
+
+
+It seems  that in classes 1 and 2, small families ( groups of two and three) tend to fair slightly better than individual passengers. If I had to guess why I'd venture that women with small children or families with infant children were given priority. I'll look into this hypothesis later. 
+
+There are so few large families in classes 1 and 2, that it's hard to make any claim about the survival rate of large families. 
+
+Class 3 passengers really show that large families are not good for survival. Of the combined 42 passengers in class 3 that come from families of size 5, 6, 8, and 11 - no one surivied. 
+
+In any case, it may be interesting to include an interaction term between family size and class. 
+
+
+ 
+##### Do children have a beter chance of survival if they are traveling with/without their parents? 
+
+I'd like to see if children (passengers under the age of 21) fair better/worse when traveling with their parents/siblings.
+
+
+```{R}
+child.survival.by.parents.siblings.class.age <- 
+      df.train %>%
+            filter(Age < 21) %>%
+            group_by(Pclass, Parch, SibSp) %>%
+            summarise(num.passengers = n(), survival.rate = mean(Survived))
+
+g1 <- child.survival.by.parents.siblings.class.age %>% ggplot(aes(x = SibSp, y = Parch, fill = survival.rate)) + geom_tile() +geom_text(aes(x = SibSp, y = Parch, label = round(survival.rate,2)), color = "white") + facet_wrap(~Pclass) + ggtitle("Child Survival Rate By Number Siblings/Parents, Split by Class")
+
+g2 <- child.survival.by.parents.siblings.class.age %>% ggplot(aes (x = SibSp, y = Parch, fill = num.passengers)) + geom_tile() + geom_text(aes(x = SibSp, y = Parch, label = num.passengers), color = "white") + facet_wrap(~Pclass) + ggtitle("Sibling/Parent Frequency By Class")
+
+grid.arrange(g1, g2, ncol = 1)
+```
+The most interesting feature here is that children in class three traveling alone have a poor survival rate. Of the 53 passengers under the age of 21 traveling without siblings or parents in the sample, only 25% survived. It seems that having just one parent as a companion improves survival rates significantly. 
+
+A similar pattern emerges for children in class 2, though less convincingly because the sample of children is smaller. 
+
+I'll include an interaction term between _Age_ and _Parch_, I think.
+
+
+##### Do adults have a better/worse chance if they have children? 
+
+```{R}
+df.train %>%
+      filter(Age > 21) %>%
+      group_by(Parch) %>%
+      summarize(num.passengers = n(), survival.rate = mean(Survived))
+```
+```{R}
+adult.survival.by.children.class <- 
+      df.train %>%
+            filter(Age > 21) %>%
+            group_by(Parch, Pclass) %>%
+            summarize(num.passengers = n(), survival.rate = mean(Survived))
+
+g1 = ggplot(data = adult.survival.by.children.class, aes(x = Parch, y = survival.rate)) + geom_col() + facet_wrap(~Pclass, ncol = 1) + ggtitle("Adult Survival Rate by\nNumber Of Children and Class") + scale_x_continuous(breaks = 1:6)
+
+g2 = ggplot(data = adult.survival.by.children.class, aes(x = Parch, y = num.passengers)) + geom_col() + geom_text(aes(x = Parch, y = num.passengers, label = num.passengers, vjust = -.5)) + facet_wrap(~Pclass, ncol = 1) + ggtitle("Number of Adults by\nNumber Of Children and Class") + scale_x_continuous(breaks = 1:6)
+
+grid.arrange(g1, g2, ncol = 2)
+```
+
+```{R}
+adult.survival.by.children.class <-
+      df.train %>%
+            filter(Age > 21) %>%
+            group_by(Parch, Pclass, Sex) %>%
+            summarize(num.passengers = n(), survival.rate = mean(Survived))
+
+g1 <- ggplot(data = adult.survival.by.children.class, aes(x = Parch, y = survival.rate)) +  geom_bar(aes(fill = Sex), position = "dodge", stat = "identity") + facet_wrap(~Pclass) 
+
+g2 <- ggplot(data = adult.survival.by.children.class, aes(x = Parch, y = num.passengers)) +  geom_bar(aes(fill = Sex), position = "dodge", stat = "identity") + facet_wrap(~Pclass) 
+
+grid.arrange(g1, g2, nrow = 2)
+
+```
+
+It _vaguely_ looks like having one or more children helps increase monthers' survival rates slightly for passengers in class 2 and 3, though there are so few of these women that I'm not convinced. I won't include this in the model.
+
+#### Passenger title and imputing ages.
+
+_Age_ seems to be a predictive features in the training data. Many records have missing ages, however. If I could come up with a reasonable heuristic to fill missing ages, this may increase predictiveness. 
+
+One way to do this might be through the passengers title. For example, men/women with titles "Dr." and "Mrs." Are likely older than men/women with titles "Mr." and "Miss." 
+
+First I'll add a column for the passengers' titles to investigage further.
+```{R}
+# Add column for title
+df.train$Title <- as.character(lapply(str_split(lapply(str_split(df.train$Name, ","), "[[", 2), " "), "[[", 2))
+
+head(df.train[,c("Name", "Title", "Age")])
+```
+
+
+Lets see if titles  correlate with ages. 
+```{R}
+title.frequency <- df.train %>% 
+      group_by(Title) %>%
+               summarize(num.passengers = n())
+
+g1 <- df.train %>% ggplot(aes(x = Title, y = Age)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+g2 <- title.frequency %>% ggplot(aes(x = Title, y = num.passengers)) + geom_col() + theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+grid.arrange(g1, g2, ncol= 1)
+```
+There are some esoteric titles here that don't interest me (_Jonkheer_ - Dutch nobility!). I'll limit the scope to the titltes that exist in the test set.
+
+```{R}
+# Store the titles that exist in the test set in a dataframe
+test.titles <- as.data.frame( as.character(lapply(str_split(lapply(str_split(df.test$Name, ","), "[[", 2), " "), "[[", 2))) 
+
+colnames(test.titles) <- c("Title")
+
+test.titles %>% 
+      group_by(Title) %>%
+      summarize(count = n()) %>% 
+      arrange(desc(count))
+```
+
+Limiting the view to the most frequent titles shows some interesting features: 
+```{R}
+title.frequency <- df.train %>% 
+      filter(Title %in% c("Mr.", "Miss.", "Mrs.", "Master.")) %>%
+      group_by(Title) %>%
+               summarize(num.passengers = n())
+
+g_title_ages <- df.train %>% filter(Title %in% c("Mr.", "Miss.", "Mrs.", "Master.")) %>% ggplot(aes(x = Title, y = Age)) + geom_boxplot() 
+
+g_title_frequency <- title.frequency %>% filter(Title %in% c("Mr.", "Miss.", "Mrs.", "Master.")) %>%ggplot(aes(x = Title, y = num.passengers)) + geom_col() 
+
+grid.arrange(g_title_ages, g_title_frequency, ncol= 1)
+```
+
+What excites me here is that passengers with the title _Master._ tend to be very young with little variation. As we've seen, children in classes 1 and 2 fair well (especially when traveling with parents), and children traveling alone in class 3 fair very poorly. 
+
+I want to use this knowledge on records in the test set with missing ages. I'll fille missing NA values for passengers with the title "Master" as the average age for such passengers in the training set: _5 years_.
+```{R}
+# Average age for passengers with title "Master" in training set: 
+kable(df.train %>% filter(Title == "Master.", !is.na(Age)) %>% select(Age) %>% summarize(avg.age = mean(Age)))
+```
+```{R}
+# Fill missing values 
+df.train[is.na(df.train$Age) & df.train$Title == "Master.", "Age"] <- 5
+```
+
+
+##### The relationship between age and survival rate in general
+
+I never actually looked at how survival rates differ over ages graphically:
+```{R}
+df.train %>% ggplot(aes(x = Age, y = Survived)) + geom_point() + geom_smooth()
+```
+Split by class:
+```{R}
+df.train %>% ggplot(aes(x = Age, y = Survived)) + geom_point() + geom_smooth() + facet_wrap(~Pclass, ncol = 2)
+```
+
+I don't see any obvoious pattern between age and survival suggesting a higher order polynomial relationship. It seems fair to say that the older a passenger the lower his/her survival rate. 
+
+### A First Model - Logistic Regression Classifier
+
+To get things rolling, I'll implement a  logistic regression classifier. No fancy features - just to get something running and start to diagnose weaknesses. 
+
+---
+
+#### Training and cross validation set.
+```{R}
+#split rows into train and cross validation set. (records not in 'train' are in cross validation set)
+set.seed(1)
+train <- sample(1:nrow(df.train), round(.8*nrow(df.train)), replace = FALSE)
+
+```
+
+#### Define model.
+
+```{R}
+formula <- Survived ~
+      Pclass + 
+      Sex + 
+      Age + 
+      SibSp + 
+      Sex*Pclass + 
+      Parch*Age
+```
+
+Fit first Logistic Regression Classifier:
+
+```{R}
+model.1 <- glm(formula = formula, data = df.train[train,], family = binomial)
+summary(model.1)
+
+```
+
+Take a look at the predicitons on the cross validation set:
+```{R}
+cv.probs <- predict(model.1, newdata = df.train[-train, ], type = "response", na.action = "na.pass")
+head(cv.probs)
+```
+
+In a logistic regression classifier, we interpret the predicted value as $$ P(Y = 1 | X = x) $$. Therefore, we predict that Y = 1 (the passenger survived) iff our predicted probability is greater than .5, i.e $$ \hat{Y} = 1 \iff P(Y = 1 | X = x) \gt .5 $$
+
+```{R}
+# Convert logistic regression output to predictions
+cv.predictions <- rep(0, length(cv.probs))
+cv.predictions[cv.probs > .5] = 1
+
+# extract true cross validated response
+Y <- df.train[-train, "Survived"]
+```
+
+
+Now, a few functions to help with diagnostics
+
+```{R}
+classification.error <- function(pred, Y){
+      return(mean(pred != Y))
+}
+
+precision <- function(pred, Y){
+      return( sum(pred == 1 & Y ==1) / sum(pred == 1))
+}
+
+recall <-  function(pred, Y){
+      return(sum(pred == 1 & Y == 1)/sum(Y == 1))
+}
+
+F1.score <- function(pred, Y){
+      prec <- precision(pred, Y)
+      rec <- recall(pred, Y)
+      
+      return(2*(prec*rec)/(prec + rec))
+}
+
+```
+```{R}
+table(cv.predictions, Y)
+
+sprintf("Classification error: %f", classification.error(cv.predictions, Y))
+sprintf("Classification accuracy: %f", mean(cv.predictions == Y))
+sprintf("Precision: %f", precision(cv.predictions, Y))
+sprintf("Recall: %f", recall(cv.predictions, Y))
+sprintf("F1 Score: %f", F1.score(cv.predictions, Y))
+```
+
+Not awesome, but it's a start. 
+
+
+### A Second Model - Fitting Records With Missing Values
+
+As we've seen, age is an important factor in a person's survival. Many of the age values are missing, and so we cannot us a logistic regression model which uses _Age_ as a feature to predict all the values. 
+
+Instead of using a model which does not use _Age_ to make all the predictions, I'll fit a second model which does not use _Age_ as a feature, and use this to predict survival for records in the test set which lack values in the _Age_ column.
+
+#### Using titles as factors.
+
+A passenger's title stores some information about his/her age. For example, women with the title "Mrs" are likely older than women with the title "Miss." 
+
+There are over a dozen titles in the training set. To keep the model parsimonious and interpretable, I'll keep the most prominent titles (Master, Miss, Mrs, Mr), and cast all the others to "other".
+
+```{R}
+df.train <- df.train %>% 
+      mutate(Title.1 = ifelse(Title %in% c("Master.", "Miss.", "Mrs.", "Mr."), Title, "other")) %>%
+      mutate(Title.1 = ifelse(Title == "Ms.", "Miss.", Title.1)) # There is one woman with the title "Ms". I'll cast this to Miss. 
+ 
+```
+```{R}
+df.train %>% ggplot(aes(x = Title.1, y = Age)) + geom_boxplot()
+```
+
+It's not perfect, but the title does carry some information about a passenger's age. 
+
+#### Fitting the second model. 
+
+Define model.
+
+```{R}
+formula.2 <- Survived ~
+      Pclass + 
+      Sex + 
+      SibSp + 
+      Title.1 + 
+      Sex*Pclass + 
+      Parch 
+```
+
+Fit second Logistic Regression Classifier:
+
+```{R}
+model.2 <- glm(formula = formula.2, data = df.train[train,], family = binomial)
+summary(model.2)
+
+```
+
+##### Make predictions on cross validation set.
+```{R}
+cv.probs.2 <- predict(model.2, newdata = df.train[-train, ], type = "response")
+
+# Convert logistic regression output to predictions
+cv.predictions.2 <- rep(0, length(cv.probs.2))
+cv.predictions.2[cv.probs.2 > .5] = 1
+```
+
+Look at the performance for the second model.
+```{R}
+table(cv.predictions.2, Y)
+
+sprintf("Classification error: %f", classification.error(cv.predictions.2, Y))
+sprintf("Classification accuracy: %f", mean(cv.predictions.2 == Y))
+sprintf("Precision: %f", precision(cv.predictions.2, Y))
+sprintf("Recall: %f", recall(cv.predictions.2, Y))
+sprintf("F1 Score: %f", F1.score(cv.predictions.2, Y))
+```
+
+**I did not expect that.** The second model did better - both in terms of classification accuracy and F1 Score! I guess _Age_ wasn't as important as I thought, or maybe I'm not capturing the relationship between age and survival properly. Further investigation neccessary...
+
+I'll just use the second model for prediction then!
+
+#### Predict and submit.
+
+Now for prediction and submission!
+
+First I'll make the changes to the test set that I made to the training set. 
+```{R}
+
+# Add column for title
+df.test$Title <- as.character(lapply(str_split(lapply(str_split(df.test$Name, ","), "[[", 2), " "), "[[", 2))
+# Keep only the major titles, and cast the rest to "other"
+df.test <- df.test %>% mutate(Title.1 = ifelse(Title %in% c("Master.", "Miss.", "Mrs.", "Mr."), Title, "other")) %>%
+      mutate(Title.1 = ifelse(Title == "Ms.", "Miss.", Title.1)) # There is one woman with the title "Ms". I'll cast this to Miss.
+
+```
+
+Make predictions.
+```{R}
+predictions <- predict(model.2, newdata = df.test, type = "response")
+head(predictions)
+```
+
+Add predictions to dataframe, and keep only passenger ID and survival rate. 
+```{R}
+submission <- df.test %>%
+      mutate(Survived = as.integer(predictions > .5)) %>%
+      select(PassengerId, Survived)
+
+
+head(submission, 10)
+```
+
+Write submission. 
+```{R}
+write.csv(submission, "sumbmission.csv", row.names = FALSE)
+```
+
+### Next Steps.
+
+In my model, I've incorporated the most important predictors, namely:
+
+- Ticket Class
+- Sex
+- Family size
+
+I did not use all the data available to me. I did not use the _Age_, _Ticket_, _Fare_, _Cabin_, or _Embarked_ columns at all in my model. There are several questions that may provide some insight into who is likely to survive, specifically:
+
+- What is the true relationship between age and survival rate? 
+       * Is there a way I could impute missing ages? (Perhaps by joining passengers with their spouses/siblings, and assuming passengers have ages close to their spouses/siblings).
+- Were families split up between cabins? Between classes? Were families that were split up geographically less likely to survive? 
+- How to I capture economic prosperity beyond ticket class? How to I capture social status? Do these factors matter? 
+- What role does a passenger's ticket fare play in survival rate? 
+- What role does the port a passenger embarked from play in survival rate (if any)? 
+- Is there a way I can identify which passengers are part of the crew? Will this increase predictiveness? 
+
+
+Thanks for reading!
+
+-_Tamir, Fall 2017_
+

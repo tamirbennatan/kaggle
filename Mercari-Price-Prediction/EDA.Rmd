@@ -1,0 +1,1602 @@
+---
+title: "Mercari Price Suggestion"
+output:
+  html_document:
+    messages: no
+    toc: true
+    toc_depth: 5
+    df_print: paged
+    fig_height: 7
+    fig_width: 11
+    code_folding: hide
+---
+
+## 0. Introduction
+
+This is an exploratory data analysis for the Mercari Price Suggestion Challenge. After I joined this competition, my first step was to explore the data, so that I may know where to look for interesting features. This notebook is that exploration. 
+
+I notebook is intended to be an informative resource, so that if one wants to get started quickly with this data he/she can get a good understanding of what the data looks like. Taking a look at the data:
+
+
+```{R}
+data <- read.csv("data/train.tsv", row.names = NULL, sep = "\t")
+
+head(data)
+```
+
+Each record is a posting of an item for sale on Mercari. Given the name of the item, the description, brand, etc, the task is to predict the item's price. 
+
+If you're acquainted with the set of packages in the `tidyverse`, then you should have no problem following the code in this notebook, as the bulk of the work is done using the packages `dplyr`, `ggplot2` and `stringr`. 
+
+
+```{R}
+# data handling and manipulations
+suppressMessages(suppressWarnings(library(dplyr)))
+suppressMessages(suppressWarnings(library(tidyr)))
+suppressMessages(suppressWarnings(library(reshape2)))
+# string parsing and Regular Expressions
+suppressMessages(suppressWarnings(library(stringr)))
+# tidy tokenizing
+suppressMessages(suppressWarnings(library(tidytext)))
+# visualizations
+suppressMessages(suppressWarnings(library(ggridges)))
+suppressMessages(suppressWarnings(library(gridExtra)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(treemapify)))
+suppressMessages(suppressWarnings(library(corrplot)))
+```
+
+The only package that you may not be familiar with is the `tidytext` package by David Robinson. I use the `tidytext::unnest_tokens` function in this notebook, which takes in a character column and creates one row per token within that column. For example, if you take the following dummy dataframe:
+
+```{R}
+# a dummy dataframe with a text column
+dummy <- data_frame(row = c(1,2,3), text = c("this is a sentence.", "so is this.", "Meeeee tooo!")) %>%
+      mutate(num.tokens.orignal = str_count(text, "\\S+"))
+dummy
+```
+
+Then the result of the `tidytext::unnest_tokens` function is as follows:
+
+```{R}
+dummy %>%
+      unnest_tokens(token, text)
+```
+
+Each token in the `text` column becomes a row in the resulting dataframe. All other columns are preserved. To see all that the `tidytext` package has to offer, I highly recommend checking out David Robinson's and Julia Silge's book [Text Mining with R](https://www.tidytextmining.com/). 
+
+Now that you know about `tidytext::unnest_tokens`, you should be able to follow everything that's going on in this notebook. Please leave feedback and suggestions about my exploration!
+
+
+
+## 1. A first look and data normalization
+
+Here I just go through the data with rough strokes to get a feel for what I'm working with.
+
+#### 1.1 Datatypes
+
+A look at the types of the columns:
+
+```{R}
+str(data)
+```
+
+
+*name*, *brand_name* and *item_description* are all stored as factors, when it makes more sense to store these as characters, given their high cardinality. Also, I hate working with factors in `R`. 
+
+```{R}
+data$name <- as.character(data$name)
+data$brand_name <- as.character(data$brand_name)
+data$item_description <- as.character(data$item_description)
+data$category_name <- as.character(data$category_name)
+```
+
+
+#### 1.2 Extreme Prices?
+
+Before I start, I'll check if there are any clearly unreasonable prices.
+
+```{R}
+data %>%
+      ggplot(aes(x = price)) + 
+      geom_density() +
+      labs(title = "Distribution of prices")
+```
+```{R}
+data %>%
+      arrange(desc(price)) %>%
+      head(10) %>%
+      select(name, brand_name, category_name, price)
+```
+
+The distribution of prices looks believable. The most expensive items cost around $2,000, and they are almost all designer jewlery or handbags, which makes sense 
+
+#### 1.3 Missing values
+
+How many missing values does each column have? 
+
+```{R}
+lapply(data, function(v) sum(is.na(v)))
+```
+
+There are no `NA` values in the dataset, but I know that the columns are incomplete from inspecting the data. I suspect that some of the empty values are encoded as the empty string ''. 
+
+
+```{R}
+# convert the empty string to native NA 
+data <- data %>% 
+      mutate(name = ifelse(name == "", NA, name),
+             brand_name = ifelse(brand_name == "", NA, brand_name), 
+             item_description = ifelse(item_description == "", NA, item_description), 
+             category_name = ifelse(category_name == "", NA, category_name))
+```
+```{R}
+# what percentage of the data is missing for each column?
+lapply(data, function(v) mean(is.na(v)))
+```
+
+This makes more sense - after filling the empty string with `NA`, we see that around 42% of the brands are not specified, and a small portion of the data does not have a category or an item description. 
+
+---
+
+## 2. Variable Exploration
+
+Now, for the analysis. I'll go through each of the variables in the dataset, looking for interesting structure and features along the way. 
+
+
+#### 2.1 Category
+
+Taking a look at the categories stored in the data in the `category_name` column: 
+
+```{R}
+data %>%
+      count(category_name, sort = TRUE) %>%
+      rename(frequency = n)
+```
+
+The categories seem to be a backslash (`/`) delimited list of categories, with the first word being most general (e.g. Women, Men, Beauty) and the last word most specific (*Shorts*, *Necklaces*, *T-Shirts*). 
+
+The first thing I can do is split up this column into three different subcategories in the category hierarchy:
+
+```{R}
+# split the category into a hierarchy
+data <- data %>%
+      separate(col = category_name, 
+               into = c("high_category", "mid_category", "low_category"), 
+               sep = "/", 
+               remove = FALSE)
+```
+
+Now checking out the frequency of our new categories:
+
+
+```{R}
+data %>%
+      group_by(high_category) %>%
+      summarise(frequency = n(), 
+                avg.price = mean(price), 
+                price.std = sqrt(var(price))) %>%
+      arrange(desc(frequency))
+```
+
+##### 2.1.1 Distribution of prices over categories
+
+
+Taking a look at the distribution of prices in each category (note the log-scale):
+
+```{R}
+data %>%
+      ggplot(aes(x = price, fill = high_category)) + 
+      theme(legend.position = "") + 
+      geom_density() + 
+      facet_wrap(~high_category) +
+      scale_x_log10() + 
+      labs(title = "Distribution of prices over High-Categories - log-scale")
+```
+
+It looks like the overall distribution of prices have a similar shape across the categories. This doesn't tell us how much the prices vary within in a mid-level category within each high-level category, however, and much is lost in the aggregate.
+
+To see that, I'll do the following:
+
+1. Within each high-level/mid-level category combination, compute the mean/standard deviation of prices
+2. Compute the range of the average within mid-level category prices for each high-level categories
+3. Look at the distribution of prices across mid-level categories for the high-level categories with the largest range of average within mid-level average prices.
+
+```{R}
+data %>%
+      group_by(high_category) %>%
+      mutate(unique.mid_category = n_distinct(mid_category)) %>%
+      ungroup() %>%
+      group_by(high_category, mid_category) %>%
+      mutate(avg.price.mid_category = mean(price), 
+             stddev.price.mid_category = sqrt(var(price))) %>%
+      select(high_category,mid_category, price, avg.price.mid_category, stddev.price.mid_category,unique.mid_category) %>%
+      group_by(high_category) %>%
+      summarize(avg.price.range = max(avg.price.mid_category) - min(avg.price.mid_category),
+                stddev.price.range = max(stddev.price.mid_category) - min(stddev.price.mid_category),
+                unique.mid_category = first(unique.mid_category)) %>%
+      arrange(desc(avg.price.range))
+```
+
+So the average prices of the mid-level categories within the `Electronics` and `Vintage & Collectibles` have the biggest range. Plotting these within-category distributions:
+
+```{R}
+# a function for making said plot
+tmp <- function(high){
+       data %>% 
+            filter(high_category == high) %>%
+            ggplot(aes(x = price, fill = mid_category)) + 
+            geom_density() + 
+            scale_x_log10() +
+            facet_wrap(~mid_category) + 
+            labs(title = paste("Distribution of prices within '", high,"' high-level category")) + 
+            theme(legend.position = "")
+}
+```
+```{R}
+tmp("Electronics") 
+```
+
+It lookds like within the `Electronics` subcategory, `Car Audio, Video & GPS` is on one extreme of prices, while `Media` is on the inexpensive extreme. But in general, the change in shape is not drastic. 
+
+
+```{R}
+tmp("Vintage & Collectibles")
+```
+
+Again, the difference in the shape of the distributions across the mid-level in the `Vintage & Collectibles` high-level category is not extreme. 
+
+##### 2.1.2 Cardinality of product categories
+
+
+```{R}
+# how many unique low-level categories?
+data %>%
+      count(low_category, sort = TRUE) %>%
+      rename(frequency = n)
+```
+
+There are 871 unique low-level categories. Some of them are very esoteric - with only a few dozen (or only one) listing with that low-level category: 
+
+```{R}
+# esoteric low-level categories first
+data %>% count(low_category) %>%
+      rename(frequency = n) %>%
+      arrange(frequency)
+```
+
+Thinking down the line, this is going to be problematic to use as input to most machine learning algorithm. The low-level category of a listing is a categorical variable, and so to encode it we'll have to use a "one-hot" encoding scheme. This will increase the dimensionality of our datset substancially, as we'll have to add 871 variables to encode the low-level category of each variable. 
+
+A possible solution to this is to bin our low-level categories in some meaningful way. I'll probably use some variation of splitting the low-level categories into quantiles based on their average prices.
+
+But before I do so, I'll need to make sure I'm not mixing up data from low-level categories across mid and high-level categories. To be sure that I'm not doing that, I'll need to see if low-level categories are distinct amongst mid/high level categories or not:
+
+```{R}
+data %>%
+      group_by(low_category) %>%
+      summarize(distinct.mid = n_distinct(mid_category),
+                distinct.high = n_distinct(high_category)) %>%
+      arrange(desc(distinct.mid))
+```
+
+So, low-level categories are not distinct amongst high/mid-level categories. I'll have to keep this in mind. 
+
+The cardinality of low-level categories is very high. But how rare are some of the less frequently occuring categories? 
+
+
+```{R}
+data %>% 
+      group_by(low_category) %>%
+      summarise(frequency = n()) %>%
+      ungroup() %>%
+      mutate(proportion = frequency/sum(frequency)) %>%
+      arrange(desc(frequency)) %>%
+      mutate(cum.proportion = cumsum(proportion),
+             frequency.rank = row_number()) %>%
+      arrange(desc(cum.proportion)) %>%
+      ggplot(aes(x = frequency.rank, y = cum.proportion)) + 
+      geom_line() + 
+      geom_vline(xintercept = 100, linetype = "dashed", color = "red") + 
+      geom_hline(yintercept = .805, linetype = "dashed", color = "red") +
+      labs(title = "Cumulative proportion of items, by ranked low-level categories") + 
+      ylab("Cumulative proportion of postings") +
+      xlab("Rank of low-level category")
+
+```
+
+The top 100 low-level categories (out of ~870) account for 80% of the data - textbook Pareto Principle. This may make things easier if we want to bin the low-level categories later for dimensionality reduction. 
+
+
+```{R}
+data %>% 
+      group_by(mid_category) %>%
+      summarise(frequency = n()) %>%
+      ungroup() %>%
+      mutate(proportion = frequency/sum(frequency)) %>%
+      arrange(desc(frequency)) %>%
+      mutate(cum.proportion = cumsum(proportion),
+             frequency.rank = row_number(), 
+             total.mid_categories = n()) %>%
+      filter(cum.proportion <= .81) %>% 
+      arrange(desc(cum.proportion))
+```
+
+
+The top 30 mid-level categories (out of 114) account for 80% of the data. 
+
+
+##### 2.1.3 Duplicate categories?
+
+I wonder if there are duplicate categories - perhaps due to letter caseing:
+
+```{R}
+# getting the number of low-level categories, 
+# grouped by lowercased low-level category
+data %>%
+      mutate(lowercase.category = str_to_lower(low_category)) %>%
+      group_by(lowercase.category) %>%
+      summarize(num.categories = n_distinct(low_category)) %>%
+      arrange(desc(num.categories))
+```
+
+It looks like the only low-level category that is duplicated (due to caseing) is `t-shirts`. 
+
+```{R}
+# what are the different variations of t-shirts? 
+data %>%
+      filter(str_to_lower(low_category) == "t-shirts") %>%
+      count(low_category)
+```
+
+---
+
+#### 2.2 Brand Name
+
+##### 2.2.1 Missing brands
+
+The brand of a product will undoubtedly be an important factor determining the price, and so it's important to check for any noise/inconsistencies in this column:
+
+```{R}
+data %>%
+      group_by(brand_name) %>%
+      summarize(frequency = n(), 
+                avg.price = mean(price), 
+                price.stddev = sqrt(var(price))) %>%
+      arrange(desc(frequency))
+```
+Many items do not have brands listed (42%). Is that a signal for the price of the item? 
+
+```{R}
+data %>%
+      mutate(contains.brand = !is.na(brand_name)) %>%
+      ggplot(aes(x = contains.brand, y = price, fill = contains.brand)) + 
+      geom_boxplot() + 
+      scale_y_log10() + 
+      coord_flip() + 
+      labs(title = "Price distribution of postings with/without brands (log-scale)")
+```
+
+It looks like listings that contain brands tend to have higher prices on average. This will likely be a useful feature. 
+
+##### 2.2.2 Cardinality of brands
+
+There are  4,809 unique brands. Again, this will get us into dimensionality trouble when it comes to machine learning. If possible, we should bin brands together. 
+
+
+```{R}
+data %>%
+      mutate(total.postings = n()) %>%
+      group_by(brand_name) %>%
+      summarise(frequency = n(), 
+                total.postings = first(total.postings))%>%
+      ungroup() %>%
+      mutate(proportion = frequency/total.postings)%>%
+      arrange(desc(frequency)) %>%
+      mutate(cum.proportion = cumsum(proportion)) %>%
+      mutate(brand.rank = row_number()) %>%
+      ggplot(aes(x = brand.rank, y = cum.proportion)) +
+      geom_line() + 
+      geom_vline(xintercept = 70, linetype = "dashed", color = "red") + 
+      geom_hline(yintercept = .805, linetype = "dashed", color = "red")
+```
+
+Again, the Pareto Principle is in effect: the top 70 most frequently occuring brands (out of 4,809) account for 80% of the training data.
+
+##### 2.2.3 Most expensive brands
+
+What are the most expensive brands? 
+
+```{R}
+data %>%
+      group_by(brand_name) %>% 
+      summarize(avg.price = mean(price), 
+                frequency = n(), 
+                num.categories = n_distinct(high_category)) %>%
+      filter(frequency > 1000) %>%
+      arrange(desc(avg.price))
+```
+
+Not surprisingly, the most expensive brands are designer clothing/jewlery and well known electronics companies, such as Apple, and Beats by Dr. Dre. 
+
+##### 2.2.4 Product categories within brands
+
+I am surprised, however, that these top brands have items in so many high-level categories. For example, Air-Jordan makes Basketball shoes, but there are items listed under this brand in 5 high-level categories! 
+
+Looking at the relative frequencies of the high-level categories in the top-20 most expensive brands (that have  1000+ listings):
+
+```{R}
+data %>% 
+      inner_join(
+            data %>%
+                  group_by(brand_name) %>% 
+                  summarize(avg.price = mean(price), 
+                            frequency = n(), 
+                            num.categories = n_distinct(high_category)) %>%
+                  filter(frequency >= 1000) %>%
+                  top_n(20, avg.price), 
+            on = c("brand_name" = "brand_name")
+      ) %>%
+      group_by(brand_name, high_category) %>%
+      summarize(avg.price = mean(price), 
+                frequency = n()) %>%
+      arrange(brand_name) %>%
+      ggplot(aes(x = high_category, y = frequency, fill = high_category, label = high_category)) +
+      geom_col() + 
+      facet_wrap(~brand_name, scales = "free") + 
+      theme(axis.text.x = element_blank(),
+            axis.text.y = element_blank()) + 
+      theme(legend.position = "")  +
+      coord_flip() + 
+      geom_text( size = 2)
+      
+```
+
+Another way to visualize the proportion of products in each item category for each brand is with a treemap:
+
+```{R}
+data %>% 
+      inner_join(
+            data %>%
+                  group_by(brand_name) %>% 
+                  summarize(avg.price = mean(price), 
+                            frequency = n(), 
+                            num.categories = n_distinct(high_category)) %>%
+                  filter(frequency >= 1000) %>%
+                  top_n(15, avg.price), 
+            on = c("brand_name" = "brand_name")
+      ) %>%
+      group_by(brand_name, high_category) %>%
+      summarize(avg.price = mean(price), 
+                frequency = n()) %>%
+      ungroup() %>%
+      ggplot(aes(area = frequency, label = high_category, subgroup = brand_name, fill = high_category)) + 
+      geom_treemap() +
+        geom_treemap_subgroup_border() +
+      geom_treemap_subgroup_text(place = "centre", grow = T, alpha = 0.5, colour =
+                             "black", fontface = "italic", min.size = 0) +
+  geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
+  theme(legend.position = "null")
+```
+
+
+Here, each dark rectangle is a brand, and each sub-rectangle is a diferent itme category. Rectangles with one solid color like that of *Apple* and *Air Jordan* represent comanies whose offerings are primarly focused in one category, while rectangles that are split up like that of *Gucci* and *Chanel* are companies that offer products across categories. 
+
+
+We can see that for these top brands,  the majority of their items are in the same high-level categories. For example, 99.4% of Samsung's listings are under the category "Electronics", while the remaining are scattered amongst 5 other categories. 
+
+I think this is an opportunity to consolidate the high-level categories some. For brands that have an overwhelming majority of items in one high-level category, perhaps it makes more sense to convert all the categories to the most frequently occuring category. If this is the case, I could also flag if an item's high-level category is not the brand's core-competency - as a feature. 
+
+As a side note - I notice from this graph that "Jordan" and "Air-Jordan" are seperate brands. Same goes for "Beats" and "Beats by Dr. Dre". I'll quickly merge these brands into one. 
+
+```{R}
+data = data %>%
+      mutate(brand_name = case_when(
+            brand_name == "Air Jordan" ~ "Jordan",
+            brand_name == "Beats by Dr. Dre" ~ "Beats", 
+            TRUE ~ brand_name)
+      )
+```
+
+---
+
+#### 2.3 Item Condition
+
+Mercari is a marketplace for buying/selling used goods. In such an environment, it's clear that the condition of an item will be important for the asking price. 
+
+```{R}
+data %>% group_by(item_condition_id) %>%
+      summarize(frequency = n(), 
+                avg.price = mean(price)) %>%
+      melt(id.vars = c("item_condition_id")) %>%
+      ggplot(aes(x = item_condition_id, y = value, fill = variable)) + 
+      geom_col() + 
+      facet_wrap(~variable, scales = "free") + 
+      ylab("")
+```
+
+##### 2.3.1 Figuring out the meaning of the `item_condition_id` values
+
+There are 5 levels for `item-condition_id`. From the average price, it's not clear if these levels have an inherent ordering (e.g. 5 == "new", 1 == "bad condition")
+
+To figure  this out, I'll have to read some item descriptions!
+
+```{R}
+# a sample of descriptions where `item_condition_id` is 1. 
+set.seed(1)
+data %>%
+      filter(item_condition_id == 1) %>%
+      sample_n(50) %>%
+      select(item_condition_id, item_description) 
+```
+
+Reading the It seems like when `item_condition_id` is equal to one, the item is new. For example, the second rating I see here is "*Brand new sealed ps4*". 
+
+```{R}
+# a sample of descriptions where `item_condition_id` is 5. 
+set.seed(1)
+data %>%
+      filter(item_condition_id == 5) %>%
+      sample_n(50) %>%
+      select(item_condition_id, item_description) 
+```
+
+When `item_condition_id` is equal to five, the item seems to be broken or only paritally complete. For example, one of the descriptions in this sample is: "*Comes with booklet case and game but it doesn't work. Tested. Maybe it needs resurfacing.*"
+
+I can try and make this a bit more concrete by looking at which words appear more frequenlty in postings of each of the different item conditions, compared to the global frequency. This is a bit hard to follow, so to be clear about what I'm going to compute:
+
+- For each word, the proportion of postings that contain that word in the description.
+- The proportion of postings *labeled with a particular item condition* that contatain each word.
+- The difference in these proportions, as a measure of the relative prevalence of each word within the postings of each item condition compared to the rest of the postings. 
+
+This is a measure of the difference betwen the global proportion of postings that contain each word, and the proportion of postings _within each item condition group_ that contain said words. This way I can find the words that are most particular to each item condition.
+
+
+```{R}
+set.seed(1)
+tmp = data %>%
+      sample_n(100000) %>%
+      mutate(num.postings = n()) %>% # total number of postings
+      group_by(item_condition_id) %>%
+      mutate(num.postings.condition = n()) %>% # number of postings in each of the conditions
+      ungroup() %>%
+      unnest_tokens(word, item_description) %>% 
+      anti_join(stop_words) %>% # get rid of stopwords
+      group_by(word) %>%
+      mutate(postings.word = n_distinct(train_id)) %>% # how many postings have each word?
+      group_by(word, item_condition_id) %>%
+      summarise(postings.word.condition = n_distinct(train_id), # how many postigns of each item condition have each word?
+                postings.word = first(postings.word),
+                num.postings = first(num.postings), 
+                num.postings.condition = first(num.postings.condition)) %>%
+      mutate(post.proportion.with.word = postings.word/num.postings, # proportion of postings with each word
+             post.condition.proportion.with.word = postings.word.condition/num.postings.condition) %>% # proportion of postings within each condition with each word
+      mutate(proportion.difference = post.condition.proportion.with.word - post.proportion.with.word) %>% # difference in said proportions
+      ungroup() %>%
+      filter(postings.word > 100) %>% # only keep the words that appear somewhat frequently
+      select(word,item_condition_id, post.proportion.with.word, post.condition.proportion.with.word,proportion.difference) %>%
+      arrange(desc(proportion.difference))
+```
+```{R}
+tmp %>%
+      filter(item_condition_id == 5) %>%
+      arrange(desc(proportion.difference)) %>%
+      filter(row_number() <= 20) %>%
+      select(-proportion.difference) %>%
+      melt(id.vars = c("word", "item_condition_id")) %>%
+      
+      ggplot(aes(x = word, y = value, fill = variable)) + 
+      geom_col(position = "dodge") + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      coord_flip() + 
+      ylab("Proportion of postings with word") + 
+      labs(title = "Relative proportion of postings with words", 
+           subtitle = "All postings vs. postings with item_condition_id = 5")
+```
+
+In postings where `item_condition_id` = 5, words like *broken*, *missing*, *scuffs*, *screen* and *missing* appear much more frequently than in other postings. This really makes it clear that the condition of items with this `item_condition_id` are poor.
+
+
+```{R}
+tmp %>%
+      filter(item_condition_id == 1) %>%
+      arrange(desc(proportion.difference)) %>%
+      filter(row_number() <= 20) %>%
+      select(-proportion.difference) %>%
+      melt(id.vars = c("word", "item_condition_id")) %>%
+      
+      ggplot(aes(x = word, y = value, fill = variable)) + 
+      geom_col(position = "dodge") + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      coord_flip() + 
+      ylab("Proportion of postings with word")+ 
+      labs(title = "Relative proportion of postings with words", 
+           subtitle = "All postings vs. postings with item_condition_id = 1")
+      
+```
+
+In postings where `item_condition_id` = 1, words like *tags*, *sealed*, *brand* and *box* are more frequently occuring than in other postings, indicating that indeed this condition id is of newer items. 
+
+
+```{R}
+tmp %>%
+      filter(item_condition_id == 3) %>%
+      arrange(desc(proportion.difference)) %>%
+      filter(row_number() <= 20) %>%
+      select(-proportion.difference) %>%
+      melt(id.vars = c("word", "item_condition_id")) %>%
+      
+      ggplot(aes(x = word, y = value, fill = variable)) + 
+      geom_col(position = "dodge") + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      coord_flip() + 
+      ylab("Proportion of postings with word")+ 
+      labs(title = "Relative proportion of postings with words", 
+           subtitle = "All postings vs. postings with item_condition_id = 3")
+      
+```
+
+We can see that some of the words that appear in postings where `item_condition_id` = 3 indicate that these items are in poor condition, with words such as *flaws*, *holes*, *rips*, *worn* and *stains* appearing more frequently than in the rest of the postings. However, the word *excellent* appears more frequently than in in all the postings (in the aggreagate). 
+
+It seems like there is an inherent ordering in the values of `item_condition_id` after all: 
+$$
+\text{Condition of item}(i) < \text{Condition of item}(j) \\
+ \text{iff}\quad \text{item_condition_id}_i > \text{item_condition_id}_j
+$$
+
+Therefore, it wouldnt be *proposterous* to use the variable `item_condition_id` as-is in a machine learning regressor - as an integer predictor. 
+
+However, if we do so, then we are introducing additional bias, as we are asserting that the difference in quality between items with `item_condition_id` = 1 and `item_condition_id` = 2 is the same as the difference in quality between items with `item_condition_id` = 2 and `item_condition_id` = 3, and so on.
+
+We are definitely not justified to make this assertion! Just becasue we know there is an ordering to the condition id's, it does not mean we can assign a magnitude to these differences. Therefore, it will make more sense to encode this variable with a one-hot encoding, and use it as a categorical predictor come prediction time, as opposed to a numeric predictor. 
+
+##### 2.3.2 Prices of goods of each condition
+
+```{R}
+data %>%
+      ggplot(aes(x = factor(item_condition_id), y = price, fill = factor(item_condition_id))) + 
+      geom_boxplot() +
+      scale_y_log10()+
+      coord_flip() +
+      theme(legend.position = "") +
+      labs(title = "Distribution of prices over different item conditions") +
+      xlab("Item condition")
+```
+
+
+It's strange that we don't see high prices in general for each of the different condition levels. It's expecially bizzare that the median price is highest in items of `item_condition_id` equal to 5. 
+
+```{R}
+data %>%
+      group_by(item_condition_id, high_category) %>%
+      summarize(frequency = n(), 
+                avg.price = mean(price)) %>%
+      ggplot(aes(x = high_category, y = frequency, fill = factor(item_condition_id))) +
+      geom_col() + 
+      facet_grid(item_condition_id~.) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+      theme(legend.position = "")
+
+```
+```{R}
+data %>%
+      group_by(item_condition_id, high_category) %>%
+      summarize(frequency = n(), 
+                avg.price = mean(price)) %>%
+      group_by(item_condition_id) %>%
+      mutate(max_frequency = frequency == max(frequency), 
+             proportion.of.items = frequency/sum(frequency), 
+             items.with.condition = sum(frequency))  %>%
+      filter(max_frequency) %>% 
+      rename(most.common.category = high_category) %>%
+      select(item_condition_id,items.with.condition,most.common.category, proportion.of.items, avg.price)
+      
+```
+
+Oh, I see. There are just much fewer products with `item_condition_id` equal to 4 and 5. Furthermore, the majority of the items with `item_condition_id` equal to one are of the *Electronics* category, while the majority of items with `item_condition_id` equal to 1 are of category *Women*. 
+
+Women's products of poor condiition (`item_description_id` equal to 4 or 5) are not very valuable (next chart). However, used/damaged electronics in this dataset appear to be more expensive than new electronics. 
+
+```{R}
+data %>%
+      filter(high_category %in% c("Electronics", "Women"), 
+             price > 0) %>%
+      ggplot(aes(x = high_category, y = price, fill = high_category)) + 
+      geom_boxplot() + 
+      scale_y_log10()+
+      coord_flip() + 
+      facet_grid(item_condition_id~.) + 
+      labs(title = "Prices of Women's and Electronics devies, across condition levels", 
+            subtitle = "Used to explain why the average price of items of poor condition is higher than\nthat of items with good conditions.") + 
+      theme(legend.position = "") +
+      ylab("price (log scale)") +
+      xlab("High-level Product Category")
+                   
+```
+
+The two charts above also highlights something that's strange - amongst the few electronics items sold with `item_condition_id` equal to 5, the prices are generaly than the electronics items with `item_condition_id` equal to 1. 
+
+Why might that be? 
+
+**WARNING - SPECULATION!** One hypothesis is people sell smaller, cheaper items new, and don't bother selling them when they're damaged, as they are worth so little. Larger items, such as Macbooks and iPhones, hold more value even when they're damaged, and so they are sold whenthey are damaged more frequently, which may explain why electronic items of poor condition are more expensive. 
+
+
+#### 2.4 Shipping
+
+##### 2.4.1 How many items provide shipping? 
+
+```{R}
+data %>%
+      group_by() %>%
+      summarize(shipping = sum(shipping), 
+                num.postings = n()) %>%
+      mutate(no.shipping = num.postings - shipping) %>%
+      mutate(no.shipping = no.shipping/num.postings, 
+             shipping = shipping/num.postings) %>%
+      select(shipping, no.shipping) %>%
+      melt() %>%
+      ggplot(aes(x = variable, y = value, fill = variable, label = value )) + 
+      geom_col() + 
+      theme(axis.text.x = element_blank(),
+            axis.text.y = element_blank()) + 
+      geom_text(vjust = -.5)
+      
+```
+
+
+Pretty even split amongst postings that provide shipping and those who dont. 
+
+```{R}
+data %>%
+      group_by(item_condition_id) %>%
+      summarize(shipping = sum(shipping), 
+                num.postings = n()) %>%
+      mutate(no.shipping = num.postings - shipping) %>%
+      mutate(no.shipping = no.shipping/num.postings, 
+             shipping = shipping/num.postings) %>%
+      select(item_condition_id, shipping, no.shipping) %>%
+      melt(id.vars = c("item_condition_id")) %>%
+      ggplot(aes(x = variable, y = value, fill = variable)) + 
+      geom_col() + 
+      facet_grid(item_condition_id~.) + 
+      coord_flip() +
+      ylab("Proportion of postings (of given condition)") + 
+      xlab(NULL) + 
+      theme(axis.text.y = element_blank()) + 
+      labs(title = "Proportion of postings that (don't) provide shipping, split by product condition")
+```
+
+We can see that for all products of all item conditions _except `1`_ (new items), the majority of postings do not provide shipping. The overall proportion of postings that provide shipping is more equally balanced with those that do not because the global count of postings of condition 1 is larger than the rest - which the chart of proportions does not show.
+
+Looking at frequencies instead:
+
+
+```{R}
+data %>%
+      group_by(item_condition_id) %>%
+      summarize(shipping = sum(shipping), 
+                num.postings = n()) %>%
+      mutate(no.shipping = num.postings - shipping) %>%
+      select(item_condition_id, shipping, no.shipping) %>%
+      melt(id.vars = c("item_condition_id")) %>%
+      ggplot(aes(x = variable, y = value, fill = variable)) + 
+      geom_col() + 
+      facet_grid(item_condition_id~.) + 
+      coord_flip() +
+      ylab("Frequency of postings (of given condition)") + 
+      xlab(NULL) + 
+      theme(axis.text.y = element_blank()) + 
+      labs(title = "Frequency of postings that (don't) provide shipping, split by product condition")
+```
+
+There it is. 
+
+##### 2.3.2 Shipping and prices
+
+How does this affect prices? 
+
+```{R}
+data %>% 
+      mutate(shipping = ifelse(shipping == 0, "no", "yes")) %>%
+      ggplot(aes(x = shipping, y = price, fill = shipping)) + 
+      geom_boxplot(show.legend = FALSE) + 
+      scale_y_log10() +
+      xlab("Provide shipping?") + 
+      coord_flip() + 
+      labs(title = "Prices of goods that do (not) provide shipping (log scale)")
+```
+
+In the aggregate, it looks like items that do not have shipping are more expensive than those that do. But we already identfied that there are lurking variables (condition, and probably item category), and so we should be looking at more segmented data. 
+
+```{R}
+data %>% 
+      mutate(shipping = ifelse(shipping == 0, "no", "yes")) %>%
+      ggplot(aes(x = shipping, y = price, fill = shipping)) + 
+      geom_boxplot(show.legend = FALSE) + 
+      scale_y_log10() +
+      xlab("Provide shipping?") + 
+      ylab("Price (log-scale)") + 
+      coord_flip() + 
+      facet_grid(item_condition_id~.)
+```
+
+So we know that whether or not shipping is provided is dependent on the item's quality. How about the category of the itm? 
+
+
+```{R, fig.height = 8}
+data %>%
+      group_by(high_category, item_condition_id) %>%
+      summarize(shipping = sum(shipping), 
+                num.postings = n()) %>%
+      mutate(no.shipping = num.postings - shipping) %>%
+      mutate(shipping = shipping/num.postings, 
+             no.shipping = no.shipping/num.postings) %>%
+      ggplot(aes(x = high_category, y = item_condition_id, fill = shipping, label = num.postings)) + 
+      geom_tile() + 
+      geom_text() + 
+      scale_fill_distiller(palette = "Spectral", direction = 1)+ 
+      labs(title = "Percentage of postings that provide shipping, grouped by category and condition", 
+           subtitle = "Annotated with the number of postings in category/condition combination.")
+```
+
+
+Here, the color of each tile represents the proportion of postings of that type that provide shipping (cooler = more postings provide shipping. 
+
+As we've seen, items of better condition (smaller `item_condition_id`) tend to provide shipping more frequently. This is evident in that the bottom row is overall "cooler" than the rest of the rows. 
+
+We also see that some product categories are more likely to procde shipping than others. For example, brand new electronics items provide free shipping quite frequently. Regardless of item quality, it seems that items of category *Vintage & Collectibles* and *Beauty* tend to provide shipping frequently. On the other hand, items of category *Home* very rarely provide shipping - especially used/damaged home goods. 
+
+For some item categories, the liklihood of the vendor providing shipping depends very much on the item condition. For example, amongst items of the *Handmade* category, 71.29% of new items come with free shipping, while only 38.01% of used items (`item_condition_id` equal to 3) come with shipping. 
+
+
+```{R, fig.height = 8}
+data %>%
+      mutate(shipping = ifelse(shipping == 1, "shipping", "no.shipping")) %>%
+      group_by(high_category, item_condition_id, shipping) %>%
+      summarize(num.postings = n(), 
+                avg.price = mean(price)) %>%
+      ggplot(aes(x = high_category, y = item_condition_id, fill = avg.price, label = num.postings)) + 
+      geom_tile() +
+      geom_text() + 
+      facet_wrap(~shipping) + 
+      scale_fill_distiller(palette = "Spectral", direction = 1) + 
+      labs(title = "Average prices, split by shipping, item condition, and category.",
+           subtitle = "Annotated with the number of postings in category/condition combination.") + 
+      theme(axis.text.x = element_text(angle = 20, hjust = 1)) 
+
+```
+
+Now I've shown the averge prices of items, split product category, item condition, and whether or not shipping is provided. 
+
+In general, we see again that items that more expensive tend to provide shipping more frequently (the right box is more red). Interestingly enough, we can see electronics items that are only _slightly_ used (`item_condition_id` equal to 2) are much less expensive than new electronics items - for both items that do/don't provide shipping. This may indidcate that electronics items lose their value quickly as soon as they have been sold (which is why refurbished goods are so much cheaper than new ones). 
+
+For some categories, such as *Beauty* and *Sports & Outdoors*, it seems like the average price may _increase_ and the condition worsens. **A word of warning*: the data gets rather sparse for items of poor condition (because fewer items are sold in poor condition than in good condition), so these averages may be misleading. Assuming that these averages are reliable, however, a possible explanation is that for these "less luxurious" categories, such as *Sports & Outdoors*, if one is to bother selling his/her goods damaged, it's probably because that good originally had a lot of value, and so it still retains enough value to be expensive compared to many of the cheap goods that can be purchased new. 
+
+
+
+#### 2.5 Item Name and Description
+
+These two columns are the real meat of the data:
+
+```{R}
+data %>%
+      head() %>%
+      select(name, item_description,price)
+```
+
+So far the predictors we've explored are all categorical. Although it's possible to learn a performant classifier on purely categorical features, I think the opportunity to extract continuous features that distinguish between postings with otherwise identical categorical features lies in these two columns. 
+
+At the same time, these two columns are going to be the most difficult to work with. `R` lacks a powerful Natural Language Processing toolkit. While Python has tools such as `scikit-learn` for vectorization, `gensim` for working with word embeddings, `NLTK` and `SpaCy` for part of speach tagging and other miscellaneous NLP tasks, `R` has no real packages that can compete. 
+
+Thus, I'll do my best to explore these two columns and extract some interesting features, but I may have to swtich over to Python to learn my best classifier. Stay tuned!
+
+I've noticed in the sample above that one of the item descriptions is filled with the string "*No description yet*. How many descriptions are like this one? 
+
+
+```{R}
+data %>%
+      filter(item_description == "No description yet") %>%
+      nrow()
+
+```
+
+
+82,489 - around 5% of the records. To be explicit, I'll convert these values to N/A values:
+
+```{R}
+data <- data %>%
+      mutate(item_description = ifelse(item_description == "No description yet", NA, item_description)) %>%
+      mutate(has.description = !is.na(item_description))
+```
+
+
+##### 2.5.1 Missing descriptions and price
+
+Does it make a difference if the item has a description, for the price? 
+
+```{R}
+data %>%
+      ggplot(aes(x = has.description, y = price, fill = has.description)) + 
+      geom_boxplot() + 
+      coord_flip() + 
+      scale_y_log10() +
+      labs(title = "Distribution of prices, depending on if item description provide.d", 
+           subtitle = "Note the log-scale.")
+```
+
+Maybe, but not 100% clear. 
+
+```{R}
+data %>%
+      ggplot(aes(x = has.description, y = price, fill = has.description)) + 
+      geom_boxplot(show.legend = FALSE) + 
+      coord_flip() + 
+      scale_y_log10() + 
+      facet_grid(item_condition_id ~.)
+```
+
+
+
+
+```{R}
+data %>%
+      count(item_condition_id, has.description) %>%
+      rename(count = n) %>%
+      group_by(item_condition_id) %>%
+      mutate(total = sum(count)) %>%
+      mutate(label = ifelse(has.description, paste(round(count/total,3)*100, "% has\ndesc.", sep = ""), NA)) %>%
+      ggplot(aes(x = item_condition_id, y = count, fill = has.description, label = label)) + 
+      geom_col(position = "dodge") +
+      geom_text(vjust = .5) +
+      labs(title = "Proportion of items that (don't) have an item description")
+```
+
+We can see that few items don't have item descriptions, and that it looks like the proportion of items that have item descriptions is consistent amongst items of different values.
+
+
+##### 2.5.2 Name and description lengths
+
+Now, I'll extract a series of basic features about the descriptions/names, such as the word/character length of each description/names.
+
+
+```{R}
+data <- data %>% 
+      mutate(description.length = str_length(item_description), 
+             name.length = str_length(name)) %>%
+      replace_na(list(description.length = 0, name.length = 0))
+```
+```{R}
+p1 = data %>%
+      ggplot(aes(x = description.length)) +
+      geom_histogram(bins = 50) + 
+      labs(title = "Description length") 
+
+p2 = data %>%
+      ggplot(aes(x = name.length)) +
+      geom_histogram(bins = 40) + 
+      labs(title = "Name length")
+
+grid.arrange(p1, p2)
+```
+
+It looks like the mode description length is around 50 words, but people get a lot wordier than that. The length of the posting name also mpeaks at around 40 words, but there is no long tail. This is almost surely because Mercari caps the length of the title at around 40 words, and people try and get in as much information as possible into the title. 
+
+Are the lengths of a title and a length of a description correlated? 
+
+```{R}
+data %>%
+      sample_n(200000) %>%
+      ggplot(aes(x = description.length, y = name.length, color = high_category)) + 
+      geom_point(alpha = .01) + 
+      geom_smooth(se = FALSE) +
+      labs(title = "Description length vs Name length", 
+           subtitle = "Sample of data - do not interpret this as a linear relationship!")
+```
+```{R}
+cor(data$description.length, data$name.length)
+```
+
+It seems that there may be a weak relationship between the length of the description and the name of length of the name. 
+
+But how about the price? 
+
+```{R}
+corrplot(cor(select(data, price, description.length, name.length)))
+```
+
+Almost no correlation between the description/item length and the price. 
+
+##### 2.5.3 Names and descriptions with brand name
+
+Now, a hypothesis: postings of items with big brand names will likely show off about that brand. For example, if I'm selling you a handbag from Coach, I'm going to let you know it's a Coach bag, and maybe charge a premium for it. 
+
+So an interesting feature - how many of the items include the brand name in the title/item description? 
+
+```{R}
+# include logical columns which indicate if name/description contain brand name.
+data <- data %>%
+      mutate(title.contains.brand = str_detect(str_to_lower(name), str_to_lower(brand_name)), 
+             description.contains.brand = str_detect(str_to_lower(item_description), str_to_lower(brand_name)))
+```
+
+
+Does this affect price? 
+
+```{R}
+p1 <- data %>%
+      ggplot(aes(x = title.contains.brand, y = price, fill = title.contains.brand)) + 
+      geom_boxplot() + 
+      scale_y_log10() +
+      coord_flip() 
+
+p2 <- data %>%
+      count(title.contains.brand) %>%
+      rename(frequency = n) %>%
+      ggplot(aes(x = title.contains.brand, y = frequency, fill = title.contains.brand)) + 
+      geom_col()
+
+grid.arrange(p1,p2)
+```
+
+Since 42% of the orignal data does not have NA `brand_name`, the majority of this feature will be NA as well. 
+
+Of the remaining items (those that have a brand specified), it looks like those that contain the brand name in the title may have slightly higher prices in the aggregate, but in general the price spread is very similar.
+
+Splitting this up by item category:
+
+```{R, fig.height = 7}
+data %>%
+      filter(!is.na(brand_name)) %>%
+      ggplot(aes(x = title.contains.brand, y = price, fill = title.contains.brand)) + 
+      geom_boxplot() + 
+      scale_y_log10() +
+      coord_flip() +
+      facet_grid(high_category~.) + 
+      labs(title = "Prices of postings with/without brand name in title, split by item category")
+```
+
+```{R, fig.height = 7}
+data %>%
+      filter(!is.na(brand_name)) %>%
+      group_by(high_category, title.contains.brand) %>%
+      summarize(frequency = n()) %>%
+      ggplot(aes(x = title.contains.brand, y = frequency, fill = title.contains.brand)) +
+      geom_col() + 
+      facet_grid(high_category~.) + 
+      coord_flip() + 
+      labs(title = "Frequency of postings with/without brand name in title, split by category")
+```
+
+It looks like for some categories, whether or not the title contains the brand name has a larger affect on the price than others. For example, for items in the *Electronics* category, the par between the median price of items that contain the brand name in the title and those that don't is higher than for other categories (this may be subject to the small number of electronics items in that contain a brand name!). 
+
+Boxplots are good for spotting high-level differences, but I'm more interested in if there is a difference in the mechanism that determines the prices of items that contain the brand in the title and those that don't. For that purpose, I need to see the _shape_ of the data, as well as the summary statistics displayed by boxplots:
+
+
+```{R}
+data %>%
+      filter(!is.na(brand_name)) %>%
+      ggplot(aes(x = price, fill = title.contains.brand)) + 
+      geom_density(position="stack") + 
+      scale_x_log10() +
+      facet_grid(high_category~.)
+```
+
+No clear difference in the distributions of prices for items that have the brand name in the title and those that don't. Further splitting by item condition:
+
+
+```{R}
+data %>%
+      filter(!is.na(brand_name)) %>%
+      ggplot(aes(x = price, fill = title.contains.brand)) + 
+      geom_density(position="stack") + 
+      scale_x_log10() +
+      facet_grid(high_category~item_condition_id)
+```
+
+It's hard to tell because the data starts to get sparse as you partition it twice, but for the most part the shapes of the price distributions for items that have the brand name in the title and those that don't are roughly the same. 
+
+From the chart above, it looks like a few exceptions are: 
+
+- *Home* goods of condition 5
+- *Other* goods of condition 4
+- *Handmade* goods of condition 2
+
+Going through one by one, I'll see if these diffrences in distribution shape are substatial, or if they're just caused by the sparcity of the data:
+
+
+```{R}
+# a quick function for making the chart that I'm about to make a bunch of times
+tmp <- function(category, condition){
+  p1 <- data %>%
+      filter(!is.na(brand_name), 
+             high_category == category, 
+             item_condition_id == condition) %>%
+      ggplot(aes(x = price, fill = title.contains.brand)) + 
+      geom_density(position = "stack", show.legend = FALSE) +
+      xlim(0, 100) +
+      labs(title = paste(category, "goods of condition", condition),
+           subtitle = "Those with brand name nonempty.")
+
+p2 <- data %>%
+      filter(!is.na(brand_name), 
+             high_category == category, 
+             item_condition_id == condition) %>%
+      count(title.contains.brand) %>%
+      rename(frequency = n) %>%
+      ggplot(aes(x = title.contains.brand, y = frequency, fill = title.contains.brand, label = frequency)) +
+      geom_col(show.legend = FALSE) + 
+      geom_label(show.legend = FALSE)
+
+grid.arrange(p1,p2,ncol=2)   
+}
+```
+```{R}
+# *Home* goods of condition 5
+tmp("Home", 5)
+```
+
+
+There are very few *Home* goods of condition 5 with a brand name (15 total), so the distributions are not reliable. 
+
+```{R}
+# *Other* products of condition 4
+tmp("Other", 4)
+```
+
+Again, the data here is too sparse to make any claims about the difference in the distribution shapes. 
+
+
+```{R}
+tmp("Handmade", 2)
+```
+
+Again sparse data!
+
+I think it's fair to assume that the differences in the shapes of the price distributions between prices that contain the brand name in the title and those that don't was only due to the sparcity of the data after I segment it twice. I suspect this feature will not be that important. 
+
+How about if the brand name is in the item description? 
+
+```{R, fig.height = 8}
+data %>%
+      filter(!is.na(brand_name) &
+             !is.na(item_description)) %>%
+      ggplot(aes(x = description.contains.brand, y = price, fill = description.contains.brand)) + 
+      geom_boxplot() + 
+      scale_y_log10() +
+      coord_flip() +
+      facet_grid(high_category~.) + 
+      labs(title = "Prices of postings with/without brand name in item description, split by item category")
+```
+
+The spreads look almost identical. I'm not going to spend too much time trying to determine if this feature is meaningful. I suspect it is not, since whether or not the brand name was contained in the title seemed to make little difference to the price, so it seems reasonable that it would not make a difference if the brand name was in the item description. 
+
+##### 2.5.3 Looking for `[rm]` in the item descriptions
+
+Mercari wrote in the challenge description that character squences that look like prices (e.g *$20.00*) were removed and replaced by the string `[rm]` - to avoid leaking the correct answers come the prediction stage.. Perhaps the presense of this string will provide some signal:
+
+```{R}
+# store if posting name or description contain [rm]
+data <- data %>%
+      mutate(description.contains.rm  = str_detect(item_description, fixed("[rm]")),
+             title.contains.rm = str_detect(name, fixed("[rm]")))
+```
+
+Taking a look at the titles that contain `[rm]`:
+
+```{R}
+set.seed(1)
+data %>%
+      filter(title.contains.rm) %>%
+      sample_n(10) %>%
+      select(name, price)
+```
+
+
+What proportion of postings contain `[rm]` in the posting name? 
+
+```{R}
+mean(data$title.contains.rm)
+```
+
+And in the item description? 
+
+```{R}
+sum(data$description.contains.rm, na.rm = TRUE)/nrow(data)
+```
+
+Fewer than 1% have `[rm]` in the title, while amost 10% have it in the description. 
+
+What types of postings include `[rm]` in the description? 
+
+
+```{R, fig.height = 7}
+data %>%
+      filter(!is.na(item_description)) %>%
+      group_by(high_category, item_condition_id) %>%
+      summarize(proportion.contain.rm = mean(description.contains.rm), 
+                frequency = n()) %>%
+      ggplot(aes(x = high_category, y = item_condition_id, label = frequency, fill = proportion.contain.rm)) + 
+      geom_tile() + 
+      geom_text() +
+      scale_fill_distiller(palette = "Spectral", direction = 1)+ 
+      labs(title = "Percentage of postings that contain `[rm]` in item description", 
+              subitite = "Only considering posts with descriptons. Annotated with number of postings.") + 
+      theme(axis.text.x = element_text(angle = 35, hjust = 1))
+      
+```
+
+In general, it looks like *Beauty* and *Handmade* goods have the highest proportion of postings that contain the `[rm]` string in the description. It also looks like newer items seem to have it more frequently than used/damaged items. Why might that be? 
+
+##### 2.5.4 Words in the neighborhood of `[rm]`
+
+I can look at the words that tend to come before/after the `[rm]` string by splitting up the descriptions into n-grams, and looking at the n-grams that contain the string `[rm]`. The `unnest_tokens` function from the `tidytext` package makes this very easy:
+
+
+```{R}
+rm_3grams <- data %>%
+      filter(description.contains.rm) %>%
+      unnest_tokens(ngram, item_description, token = "ngrams", n = 3, drop = FALSE) %>%
+      separate(ngram, c("token1", "token2", "token3")) %>%
+      filter(token1 == "rm" | token2 == "rm" | token3 == "rm")
+
+```
+
+I have the 3-grams containing the string `[rm]`, split into three seperate columns:
+
+```{R}
+rm_3grams %>%
+      head() %>%
+      select(item_description, token1, token2, token3)
+```
+
+Each occurence of the string `[rm]` corresponds with (at most) three 3-grams - as the `[rm]` will appear as the first token, second token or the third token. 
+
+
+We can isolate the most common 3-grams where `[rm]` is in each of the third position.
+
+```{R}
+rm_3grams %>%
+      filter(token3 == "rm") %>%
+      unite(trigram, token1, token2, token3, sep = " ") %>%
+      count(trigram, sort = TRUE) %>%
+      top_n(20) %>%
+      ggplot(aes(x = trigram, y = n)) + 
+      geom_col(fill ="blue") +
+      coord_flip() + 
+       labs(title = "Most common trigrams that end with [rm] in descriptions", 
+           subtitle  = "With `[rm]` as the third token")
+```
+
+We can see that these trigrams really do seem to refer to prices - the most common trigram that ends with `[rm]` is *"retails for [rm]*.
+
+How about  when the `[rm]` is at the beginning of the trigram? 
+
+```{R}
+rm_3grams %>%
+      filter(token1 == "rm") %>%
+      unite(trigram, token1, token2, token3, sep = " ") %>%
+      count(trigram, sort = TRUE) %>%
+      top_n(20) %>%
+      ggplot(aes(x = trigram, y = n)) + 
+      geom_col(fill ="red") +
+      coord_flip() + 
+      labs(title = "Most common trigrams that end with [rm] in descriptions", 
+           subtitle  = "With `[rm]` as the first token")
+```
+
+here the most common trigrams with `[rm]` as the first token strings like "*rm free shipping*", and "*[rm] plus tax*"
+
+And in the middle? 
+
+```{R}
+rm_3grams %>%
+      filter(token2 == "rm") %>%
+      unite(trigram, token1, token2, token3, sep = " ") %>%
+      count(trigram, sort = TRUE) %>%
+      top_n(20) %>%
+      ggplot(aes(x = trigram, y = n)) + 
+      geom_col(fill ="violet") +
+      coord_flip() + 
+      labs(title = "Most common trigrams that end with [rm] in descriptions", 
+           subtitle  = "With `[rm]` as the second token")
+```
+
+Common trigrams with the `[rm]` string as the second token correspond to phrases like "*for $50 each*" or "*for $50 plus tax"*
+
+Another common sequence are the sequence "for" + "[rm]" + "[a number]" - such as "*for `[rm]` 5*". I'm not really sure what type of sentence this corresponds to
+
+##### 2.5.5 Trying to cheat...
+
+
+Overall, it looks like the folk at Mercari did a good job of removing the prices from the descriptions. 
+
+**But did they miss any? ** That would be one juicy feature.
+
+I'll try and find sequences of strings in the item descriptions that match a pattern of a phrase like "*retails for $100*". I will then extract the suspected price (100, in this case)
+
+```{R}
+# define a pattern sentences that include something along the lines of "retails for ..."
+retail_rgx = regex("(retail(s|)|selling|original|price|for) (for|only|at|price|is) ((\\$|)[0-9]+)")
+```
+```{R}
+tmp <- data %>%
+      filter(str_detect(str_to_lower(item_description), pattern = retail_rgx)) %>%
+      mutate(extracted = str_extract(item_description, retail_rgx)) %>%
+      filter(!is.na(extracted)) %>%
+      select(extracted, price) %>%
+      mutate(extracted.price = as.numeric(str_extract(extracted, pattern = "[0-9]+"))) %>%
+      mutate(diff = extracted.price - price)
+
+tmp
+```
+
+```{R}
+tmp %>%
+      filter(extracted.price < 1000) %>%
+      ggplot(aes(x = extracted.price, y = price)) + 
+      geom_point() +
+      geom_smooth() + 
+      labs(title = "Extracted retail price (from description), and true price")
+```
+
+We have correlation! We can see that as the (suspected) retail price goes up, so does the actual price. Further, the true price seems to be less than the retail price, which makes sense - if someone is putting the retail price in an item description, it's probably because he's off about how his item is cheaper than retail. 
+
+```{R}
+pkg_regex = regex("([0-9]+ for [0-9]+)")
+```
+
+```{R}
+tmp_package = data %>%
+      filter(str_detect(str_to_lower(item_description), pattern = pkg_regex)) %>%
+      mutate(extracted = str_extract(item_description, pkg_regex)) %>%
+      filter(!is.na(extracted)) %>%
+      select(extracted, price) %>%
+      mutate(extracted_price = as.numeric(str_extract(extracted, pattern = "(?<= )[0-9]+"))) %>%
+      mutate(pkg = as.numeric(str_extract(extracted, "[0-9]+"))) %>%
+      mutate(pkg = ifelse(pkg < 1, 1, pkg)) 
+```
+
+```{R}
+tmp_package
+```
+
+I've extracted 1,256 values that match the pattern "*[number] for [number]*." The idea here is that the person is selling units in bulk. 
+
+The problem with this pattern is that a string like "5 for 10" can be interpreted as "five dollars for 10 units" or "five units for 10 dollars". Further, it's not clear wither the posting is selling one unit at a time *with the option of selling in bulk*, in which case the expected per-unit price would be something like (dollar amount of bulk order)/(number of units in bul order), or if the person is selling the items in bulk, in which case the expected price would be just `(dollar amount of bulk order)`
+
+I can test the three interpretations - each of which produce a suspected price - and see which is most highly correlated with the true price:
+
+```{R}
+tmp_package = tmp_package %>%
+      mutate(pkg.price = extracted_price/pkg) %>%
+      mutate(max.interpration.price = ifelse(pkg.price > 0, pmax(pkg.price, 1/pkg.price), pkg.price))
+```
+
+
+```{R}
+tmp_package %>%
+      ggplot(aes(x = extracted_price, y = price)) +
+      geom_point() + 
+      geom_smooth() + 
+      labs(tilte = "Extracted vs actual price",
+           subtitle = "Price extracted is third number in matched string.")
+```
+```{R}
+tmp_package %>%
+      ggplot(aes(x = pkg.price, y = price)) +
+      geom_point() + 
+      geom_smooth() + 
+      labs(tilte = "Extracted vs actual price",
+           subtitle = "Price assumed to be third number extracted string, divided by first")
+```
+
+```{R}
+tmp_package %>%
+      ggplot(aes(x = max.interpration.price, y = price)) +
+      geom_point() + 
+      geom_smooth() + 
+      labs(tilte = "Extracted vs actual price",
+           subtitle = "Price assumed to be the max third number extracted string divided by first, and the reciprocal.")
+```
+
+
+```{R}
+select(tmp_package, extracted_price, pkg.price,max.interpration.price, price) %>%
+      cor() %>%
+      corrplot(type = "upper")
+
+```
+
+
+The extracted value which is most highly correlated with is the interpretation that says that "*[a] for [b]*" indi that the price is *b*.
+
+
+Now, considering the trigrams where the `[rm]` appears as the first token - common strings are things like "*[rm] plus tax*" and "*[rm] free shipping*"
+
+I'll try and extract these as well with a regex:
+
+```{R}
+first_tkn_rgx = regex("[0-9]+ (free|plus|includ(e|ing)) (tax|ship(ping|)|all|include(d|))")
+```
+```{R}
+tmp_first = data %>%
+      filter(str_detect(str_to_lower(item_description), pattern = first_tkn_rgx)) %>%
+      mutate(extracted = str_extract(item_description, first_tkn_rgx)) %>%
+      filter(!is.na(extracted)) %>%
+      mutate(extracted.price = as.numeric(str_extract(extracted, "[0-9]+")))  
+```
+```{R}
+tmp_first %>%
+      ggplot(aes(x = extracted.price, y = price)) + 
+      geom_point()
+
+```
+```{R}
+select(tmp_first, extracted.price, price) %>%
+      cor() %>%
+      corrplot(type="upper")
+```
+
+There's a small correlation between the extracted price and the true price. 
+
+**Sigh...**
+
+These leaked prices are a nice find, but unfortunatley I can only extract suspected prices for ~2000 rows. This feature may be predictive, but it would be far too sparse to use for a dataset of 1.5 million records. 
+
+##### 2.5.6 Words that appear in posting groups, binned by prices
+
+If we try and blindly use a term-document matrix as features we are likely to run into problems. The dimensionality of our data will be massive, and although our data is rather lager (1.5 million records), this is not idea.
+
+I'm interested in what types of words appear in items of different price ranges. This way I can just keep the words that explain the most variance in the prices. 
+
+Binning the items into 10 bins based on the quantiles of the prices:
+
+```{R}
+data <- data %>%
+      mutate(price.bin = ntile(price, n = 10)) 
+
+data$price.bin = as.factor(data$price.bin)
+
+data %>%
+      group_by(price.bin) %>%
+      summarize(num.postings = n(), 
+                avg.price = mean(price), 
+                min.price = min(price), 
+                max.price = max(price))
+```
+
+
+Now, I take a sample of 10,000 postings from each bin, and count the number of times a word appears in that each bin:
+
+
+```{R}
+set.seed(1)
+tmp = data %>%
+      group_by(price.bin) %>%
+      sample_n(20000) %>%
+      ungroup() %>%
+      unnest_tokens(word, item_description) %>%
+      anti_join(stop_words)
+
+
+
+tmp %>%
+      count(price.bin, word) 
+```
+
+```{R, fig.height = 7}
+tmp %>%
+      count(price.bin, word) %>%
+      group_by(price.bin) %>%
+      top_n(n = 15, wt = n) %>%
+      ungroup() %>%
+      filter(!is.na(price.bin)) %>%
+      mutate(word = reorder(word, n)) %>%
+      ggplot(aes(x = word, y = n, fill = factor(price.bin))) + 
+      geom_col() +
+      coord_flip() + 
+      facet_wrap(~price.bin, scales = "free", ncol = 2) +
+      theme(legend.position = "") + 
+      labs(title = "Most common words in each of the different price bins",
+           subtitle = "Sample of 200,000 out of 1,500,000 records")
+```
+
+Note: in the chart above, the different price bins are not enforced to have the same top-15 words - it just so happens that all the groups have the same words that are most frequently occuring in common. 
+
+What I'm more interested is words that are particular to a given group - specifically which words appear more frequently in certain groups than others, and which words have higher/lower variance in their appearences within a group than others:
+
+```{R, fig.height}
+binned.averages = tmp %>%
+      mutate(num.postings =  n_distinct(train_id)) %>%
+      group_by(word) %>%
+      summarize(num.postings = first(num.postings),
+                posts.with.word = n_distinct(train_id)) %>%
+      mutate(avg.posts.contain.word = posts.with.word/num.postings) %>%
+      ungroup() %>%
+      inner_join(
+            tmp %>%
+                  group_by(price.bin) %>%
+                  mutate(num.posts.bin = n_distinct(train_id)) %>%
+                  group_by(price.bin, word) %>%
+                  summarize(num.posts.bin = first(num.posts.bin), 
+                            posts.with.word.bin = n_distinct(train_id)) %>%
+                  ungroup() %>%
+                  mutate(avg.posts.contain.word.bin = posts.with.word.bin/num.posts.bin) 
+                  
+      ) %>%
+      mutate(inter.average.diff = avg.posts.contain.word.bin - avg.posts.contain.word) %>%
+      arrange(desc(abs(inter.average.diff))) %>%
+      filter(!is.na(word)) 
+
+```
+
+ 
+```{R, fig.height = 9}
+binned.averages %>%
+      filter(posts.with.word > 2000) %>%
+      group_by(price.bin) %>%
+      top_n(10, wt = abs(inter.average.diff)) %>%
+      select(word,price.bin, avg.posts.contain.word, avg.posts.contain.word.bin)  %>%
+      mutate(deviation = avg.posts.contain.word.bin - avg.posts.contain.word) %>%
+      arrange(deviation) %>%
+      within(word <- factor(word, levels = unique(reorder(word, deviation)))) %>%
+      ggplot(aes(x = word, y = deviation, fill = (deviation > 0))) +
+      geom_col(show.legend = FALSE) +
+      coord_flip() +
+      facet_wrap(~price.bin, scales = "free", ncol = 2) + 
+      labs(title = "Frequency of word within price bin, relative to global frequency.",
+           subtitle = "Displayed are words whose within-bin average occurence is most different than the global average")
+```
+
+
+This, in my opinion, is the most interesting graph in the whole notebook. After binning the postings into 10 quantiles based on their prices, I computed the average number of posts that contain each word *within each bin*, and then the average number of posts that contain each word *over all bin*. The graph above shows the 10 words from each bin who'se within-bin average is most different from the global average - indicating that they are special to that bin. 
+
+For price bins one and two - the least expensive bins, we see few postings with the words *authentic* and *box* with a relatively low frequency, while the the word  occurs with relatively high frequency. This makes sense, as inexpensive items are less likely to be *authentic* or come straight out of the  *box*.
+
+The most expensive items - price bins 9 and 10 - contain words like *leather*, *condition*, and *worn* more frequently than the global average. This could be becuase *leather* items are expensive, expensive items are in great *condition*, and have rarely been *worn*. 
+
+```{R}
+binned.averages %>%
+      filter(posts.with.word > 2000) %>%
+      group_by(price.bin) %>%
+      top_n(25, wt = abs(inter.average.diff)) %>%
+      ungroup() %>%
+      select(word)  %>%
+      unique() %>%
+      rename(variance.words = word)
+```
+
+
+Here I have the  set of words which have the biggest difference in the within-bin proportion and global proportion. There are only 63 terms. If I use the bag-of-words (term matrix) model for only these words, the dimensionality will be manageable. Hopefully the presense of these words will also be predictive. 
+
+## 3. Conclusion
+
+This has been an extensive exploration of the Mercari dataset. After this exploration, I feel equipped to extract features to build a performant model (stay tuned for my notebook in which I build the model!)
+
+A recap of some of the important points covered in this notebook:
+
+- Categories, as well as brand names, have a very high cardinality. However, a small subset of the categories/brands account for the majority of postings. This provides an opportunity for dimensionality reduction. 
+- The condition of an item, product category, and whether or not shipping is provided, do not seem to be very explanitory on their own. However, they interact in interesting - and hopefully explanitory - ways. 
+- It may be infomative to note if the string `[rm]` is present in the item descriptions. 
+- Some words appear more frequently within products of a certain price range than others. The presense of these words may be interesting to encode as features - encoded as a term matrix. 
+
+If you've read this far, thank you. Please provide feedback and suggestions - that's what I write for! 
+
+-Tamir
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

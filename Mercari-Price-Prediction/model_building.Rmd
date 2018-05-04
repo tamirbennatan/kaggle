@@ -1,0 +1,834 @@
+---
+title: "Mercari Price Suggestion- Model Building"
+output:
+  html_document:
+    messages: no
+    toc: true
+    toc_depth: 4
+    df_print: paged
+    fig_height: 6
+    fig_width: 8
+---
+
+## 0. Introduction
+
+Here I build my first model for the Mercari Price Suggestion Challenge. 
+
+I posted [an extensive exploratory analysis](https://www.kaggle.com/timib1203/one-honking-data-exploration-mercari-prices) - where I uncovered the structure that motivate the features engineered in this notebook. If you want to learn more about the data, that notebook will be more useful than this one. Please check it out, and leave feedback!
+
+To ensure that I process the training and test data identically, whenever I make a change to the training data, I'll create a function which applies said transformations. This way I can also apply the identical transformations to the test set.
+
+```{R}
+start_time <- Sys.time()
+```
+
+```{R}
+# data handling and manipulations
+library(Matrix)
+suppressMessages(suppressWarnings(library(dplyr)))
+suppressMessages(suppressWarnings(library(tidyr)))
+suppressMessages(suppressWarnings(library(reshape2)))
+# string parsing and Regular Expressions
+suppressMessages(suppressWarnings(library(stringr)))
+# tidy tokenizing
+suppressMessages(suppressWarnings(library(tidytext)))
+# visualizations
+suppressMessages(suppressWarnings(library(ggplot2)))
+
+library(xgboost)
+
+```
+
+
+## 1. Data loading and normalization
+
+#### 1.1 Load data
+
+```{R}
+train <- read.csv("data/train.tsv", row.names = NULL, sep = "\t")
+# keep track of original columns, in order to revert to loading columns
+ORIGINAL.COLUMNS = colnames(train)
+# sample to play around with 
+# set.seed(1)
+# tmp = sample_n(train, 100)
+```
+
+```{R}
+# return to orignal columns 
+train = train[ORIGINAL.COLUMNS]
+```
+#### 1.2 Normalize data
+
+There are a few things that I want to fix in the data before starting to build the design matrix. 
+
+
+```{R}
+# function to apply preliminary cleaning tranformations
+normalize.data <- function(data){
+      # convert the types of factors to characters
+      data$name <- as.character(data$name)
+      data$brand_name <- as.character(data$brand_name)
+      data$item_description <- as.character(data$item_description)
+      data$category_name <- as.character(data$category_name) 
+      # convert the empty string to naive NA values
+      data <- data %>% 
+            mutate(name = ifelse(name == "", NA, name),
+                   brand_name = ifelse(brand_name == "", NA, brand_name), 
+                   item_description = ifelse(item_description == "", NA, item_description), 
+                   category_name = ifelse(category_name == "", NA, category_name)) %>%
+            replace_na(list(category_name = "novalue/novalue/novalue", 
+                            brand_name = "novalue")) %>%
+            mutate(name = str_replace_all(name, fixed(" "), "_"),
+                   brand_name = str_replace_all(brand_name, fixed(" "), "_"), 
+                   category_name = str_replace_all(category_name, "[^a-zA-Z0-9/]", "_")) %>%
+            mutate(brand_name = str_replace_all(brand_name, "[^a-zA-Z0-9]", "_"))
+      
+      # lowercase brand and item description values
+      data <- data %>%
+            mutate(brand_name = str_to_lower(brand_name), 
+                   item_description = str_to_lower(item_description))
+      # fill item descriptions of `no item description` to NA
+      data <- data %>%
+            mutate(item_description = ifelse(item_description == "no description yet", NA, item_description))
+      return (data)
+}
+```
+
+Now, when we apply the function on our training set, the types of its columns will change appropriately. 
+
+```{R}
+# types/values before transform
+str(train)
+```
+
+
+```{R}
+# train <- train[ORIGINAL.COLUMNS]
+
+# apply transform
+train <- normalize.data(train)
+
+# types/values after transform
+# str(train)
+```
+
+
+
+## 1. Building the design matrix. 
+
+Here, I start to build the features described in my exploratory notebook. 
+
+#### 1.1 Category
+
+A function to split the category into three categories (high-level, mid-level, low-level)
+```{R}
+split.category <- function(data){
+      # split the category into a hierarchy
+      data <- data %>%
+            mutate(category_name = str_to_lower(category_name)) %>%
+            separate(col = category_name, 
+                     into = c("high_category", "mid_category", "low_category"), 
+                     sep = "/", 
+                     remove = FALSE) %>%
+            unite(mid.low.categories, mid_category, low_category, sep = "|", remove = FALSE)
+      return(data)
+}
+```
+
+
+```{R}
+train <- split.category(train)
+```
+
+```{R}
+# head(train)
+```
+
+
+
+Now, a function for converting the high category into one-hot encodings
+
+First get the levels for the categories
+```{R}
+high.category.levels <- train %>%
+      count(high_category) %>% 
+      .$high_category 
+```
+
+```{R}
+category.onehot <- function(data){
+      # first, fill any categories that aren't one of the factors to NA
+      data <- data %>%
+            mutate(high_category = ifelse(high_category %in% high.category.levels, high_category, "novalue"))
+      
+      # Now, encode as a factor 
+      data$high_category <- factor(data$high_category, levels = high.category.levels)
+      
+      return(data)
+}
+
+```
+
+```{R}
+train <- category.onehot(train)
+```
+
+```{R}
+# head(train)
+```
+
+
+Now, to encode the low and mid-level categories:
+
+
+The 100 first combinations of low/mid categories account for around 75% of the data:
+
+```{R}
+low.mid.category.levels = train %>%
+      count(mid.low.categories, sort = TRUE) %>%
+      top_n(99) %>%
+      .$mid.low.categories %>%
+      c(., "other")
+```
+
+And a function for converting the low.mid categories to one-hot encodings:
+
+```{R}
+low.mid.categories.onehot <- function(data){
+      # convert any categories not in levels to "other"
+      data <- data %>%
+            mutate(mid.low.categories = ifelse(mid.low.categories %in% low.mid.category.levels, mid.low.categories, "other"))
+      
+      # change to a factor
+      data$mid.low.categories <- factor(data$mid.low.categories, levels = low.mid.category.levels)
+      
+      return(data)
+}
+```
+
+```{R}
+train <- low.mid.categories.onehot(train)
+```
+
+```{R}
+# head(train)
+```
+
+#### 1.2 Brand name
+
+Here, I'll keep the 70 most frequenlty occuring brands, and one for all else
+
+```{R}
+brand.levels <- train %>%
+      mutate(brand_name = case_when(
+            brand_name == "air jordan" ~ "jordan",
+            brand_name == "beats by dr. dre" ~ "beats", 
+            TRUE ~ brand_name)
+      ) %>%
+      count(brand_name, sort = TRUE) %>%
+      top_n(70) %>%
+      .$brand_name %>%
+      c(., "other")
+```
+
+
+A function for converting brand to one-hot vectors
+
+```{R}
+brand.onehot <- function(data){
+      # convert brands to "other" if they're not in the labels
+      data <- data %>% 
+            mutate(brand_name = case_when(
+                  brand_name == "air Jordan" ~ "jordan",
+                  brand_name == "beats by dr. dre" ~ "beats", 
+                  TRUE ~ brand_name)
+            ) %>%
+            mutate(brand_name = ifelse(brand_name %in% brand.levels, brand_name, "other"))
+      
+      # add a column for whether or not the brand is NA
+      data <- data %>%
+            mutate(missing.brand = brand_name == "novalue")
+      
+      # convert to a factor 
+      data$brand_name <- factor(data$brand_name, levels = brand.levels)
+      
+      
+      return(data)
+}
+```
+
+
+```{R}
+train <- brand.onehot(train)
+```
+
+
+```{R}
+# head(train)
+```
+
+
+#### 1.3 Item condition
+
+The levels here are 1,2,3,4,5. I'll add an extra one, just in case the test set has NA condition. 
+
+```{R}
+condition.levels = c(1,2,3,4,5,6)
+```
+
+And a function for encding the item condition
+
+```{R}
+condition.onehot <- function(data){
+      # if the condition is not in one of the levels, cast it to NA
+      data <- data %>%
+            mutate(item_condition_id = ifelse(item_condition_id %in% condition.levels, item_condition_id, -1))
+      
+      # convert to factor
+      data$item_condition_id <- factor(data$item_condition_id, levels = condition.levels)
+      
+      
+      return(data)
+}
+```
+
+```{R}
+train <- condition.onehot(train)
+```
+
+```{R}
+# head(train)
+```
+
+#### 1.4 Shipping
+
+A binary variable that encodes if there's shipping
+
+```{R}
+shipping.binary.var <- function(data){
+      # fill values with 0 
+      data <- data %>%
+            replace_na(list(shipping = 0))
+      
+      # convert to a factor
+      data$shipping <- factor(data$shipping)
+      
+      return(data)
+}
+```
+
+
+```{R}
+train <- shipping.binary.var(train)
+```
+
+```{R}
+# head(train,100)
+```
+
+
+#### 1.5 Item description
+
+- is missing
+- title contains brand
+- description contains [rm]
+
+```{R}
+basic.text.features <- function(data){
+      data <- data %>%
+            mutate(description.missing = is.na(item_description), 
+                   title.contains.brand = str_detect(name, as.character(brand_name)), 
+                   description.contains.rm = str_detect(item_description, fixed("[rm]"))) %>%
+            replace_na(list(title.contains.brand = FALSE, description.contains.rm = FALSE))
+      
+      return(data)
+            
+}
+```
+
+
+
+```{R}
+train <- basic.text.features(train) 
+```
+
+```{R}
+# head(train)
+```
+
+
+#### 1.6 Bin specific words
+
+```{R}
+tmp = train %>%
+      mutate(price.bin = ntile(price, n = 10))  %>%
+      group_by(price.bin) %>%
+      sample_n(20000) %>%
+      ungroup() %>%
+      unnest_tokens(word, item_description) %>%
+      anti_join(stop_words)
+
+binned.averages = tmp %>%
+      mutate(num.postings =  n_distinct(train_id)) %>%
+      group_by(word) %>%
+      summarize(num.postings = first(num.postings),
+                posts.with.word = n_distinct(train_id)) %>%
+      mutate(avg.posts.contain.word = posts.with.word/num.postings) %>%
+      ungroup() %>%
+      inner_join(
+            tmp %>%
+                  group_by(price.bin) %>%
+                  mutate(num.posts.bin = n_distinct(train_id)) %>%
+                  group_by(price.bin, word) %>%
+                  summarize(num.posts.bin = first(num.posts.bin), 
+                            posts.with.word.bin = n_distinct(train_id)) %>%
+                  ungroup() %>%
+                  mutate(avg.posts.contain.word.bin = posts.with.word.bin/num.posts.bin) 
+                  
+      ) %>%
+      mutate(inter.average.diff = avg.posts.contain.word.bin - avg.posts.contain.word) %>%
+      arrange(desc(abs(inter.average.diff))) %>%
+      filter(!is.na(word)) 
+
+variance.words <- binned.averages %>%
+      filter(posts.with.word > 2000) %>%
+      group_by(price.bin) %>%
+      top_n(25, wt = abs(inter.average.diff)) %>%
+      ungroup() %>%
+      select(word)  %>%
+      unique() %>%
+      rename(variance.words = word) %>%
+      filter(variance.words != "rm") %>%
+      .$variance.words
+```
+
+
+```{R}
+variance.words.onehot <- function(data){
+      for (i in 1:length(variance.words)){
+            newcol = paste(variance.words[[i]], sep = "")
+            data[newcol] = str_detect(data$item_description, variance.words[[i]])
+            
+            data[newcol][is.na(data[newcol])] <- FALSE
+      }
+      return(data)
+}
+```
+
+```{R}
+train <- variance.words.onehot(train)
+```
+
+```{R}
+# head(train)[,200:260]
+```
+
+Now a function to remove the unneeded columns. Note that train_id is kept. 
+
+```{R}
+filter.columns <- function(data)
+
+      return(
+            select(data, -name, -category_name, -mid_category, 
+                        -low_category, -item_description)
+      )
+```
+
+```{R}
+train <- filter.columns(train)
+```
+
+```{R}
+end_time <- Sys.time()
+
+end_time - start_time
+```
+
+## 2. Build XGboost model
+
+First step is to create a sparse matrix from the dataset `train`. Will remove the train_id because it's not needed. Store the response in a seperate column
+
+```{R}
+# get a sparse matrix
+sparse_matrix = sparse.model.matrix(price~.-1, data = select(train, -train_id))
+
+#store the response in a seperate vector
+response = train$price
+
+```
+
+**NOTE** at this point I can `rm(train)` - since don't need it anymore (to save memoy) TODO!
+
+now, make training and validation splits
+```{R}
+## set the seed to make your partition reproductible
+set.seed(123)
+train_ind <- sample(seq_len(length(response)), size = .8*length(response),replace = FALSE)
+
+X_train <- sparse_matrix[train_ind,]
+X_dev <- sparse_matrix[-train_ind,]
+
+y_train <- response[train_ind]
+y_dev <- response[-train_ind]
+```
+
+```{R}
+start_time = Sys.time()
+
+
+
+cv <- xgb.cv(data = sparse_matrix, label = response, nrounds = 300, nfold = 3, metrics = list("rmse"), early_stopping_rounds = 5)
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+```{R}
+cv$evaluation_log %>%
+      select(iter,train_rmse_mean,test_rmse_mean) %>%
+      melt(id.vars = c("iter")) %>%
+      ggplot(aes(x = iter, y = value, color = variable)) + 
+      geom_line() 
+```
+
+```{R}
+y_pred <- predict(bst, X_dev)
+
+sqrt(mean(y_pred - y_dev)**2)
+
+cv$params
+```
+
+```{R}
+tmp = train[1:100,]
+```
+
+
+## 3. Parameter Tuning
+
+A function for performing the gridsearch
+
+```{R}
+grid.search <- function(grid, k, nrounds, print_every, early){
+      
+      set.seed(8)
+      
+      best.error <- Inf
+      best.model <- NULL
+      
+      # store the history
+      history <- grid %>%
+            mutate(rmse = NA)
+      
+      for (i in 1:nrow(grid)){
+            # extract the params
+            params <- as.list(grid[i,])
+            
+            # run the cv
+            cv.tmp <- xgb.cv(data = sparse_matrix, label= response, params = params, nrounds = nrounds, nfold = k,
+                             print_every_n =  print_every, early_stopping_rounds = early)
+            
+            # extract the best 
+            tmp.score = max(cv.tmp$evaluation_log$test_rmse_mean)
+            
+            if(tmp.score < best.error){
+                  best.error <- tmp.score
+                  best.model <- cv.tmp
+            }
+            
+            history[i,"rmse"] = tmp.score
+      }
+      
+      # return the best model found
+      return(list(model = best.model, history = history))
+            
+}
+
+```
+
+First - test difference values of depth and child weight:
+
+
+
+```{R}
+grid.1 = expand.grid(max_depth = c(3,8,12), min_child_weight = c(1,3))
+
+grid.result.1 <- grid.search(grid = grid.1, k = 3,nrounds = 800, print_every = 10, early = 5)
+```
+
+```{R}
+grid.result.1$params
+```
+
+```{R}
+grid.1
+```
+```{R}
+grid.result.1$best_ntreelimit
+```
+
+
+```{R}
+chart.log <- function(cvmodel){
+      cvmodel$model$evaluation_log %>%
+      select(iter,train_rmse_mean,test_rmse_mean) %>%
+      melt(id.vars = c("iter")) %>%
+      ggplot(aes(x = iter, y = value, color = variable)) + 
+      geom_line() 
+}
+```
+
+```{R}
+chart.log(grid.result.1)
+```
+
+Ok, so it looks like the more complex models (12 trees did better). The one that enforced some regularization performed better (min_child_weight = 3). 
+
+```{R}
+grid.2 <- expand.grid(max_depth = c(12, 18), 
+                      min_child_weight = c(1, 3, 9),
+                      gamma = c(0.0, 0.2, 0.6))
+```
+
+```{R}
+grid.results.2 <- grid.search(grid = grid.2, k = 3, nrounds = 1000, print_every = 10, early = 5)
+```
+```{R}
+grid.results.2$history
+```
+```{R}
+grid.results.2$model$params
+```
+```{R}
+
+grid.results.2$model$niter
+```
+
+
+```{R}
+chart.log(grid.results.2)
+```
+```{R}
+grid.results.2$model$params
+```
+
+Ok, So we can afford to learn more complex models, but we really gotta up the regularization. Also, reduce learning rate. 
+
+```{R}
+grid.3 <- expand.grid(eta = c(.1), max_depth = c(18, 28), gamma = c(.4, .8, 2.0))
+
+grid.3
+```
+
+```{R}
+grid.results.3 <- grid.search(grid = grid.3, k = 3, nrounds = 1200, print_every = 50, early = 7)
+```
+```{R}
+chart.log(grid.results.3)
+```
+
+```{R}
+grid.results.3$history
+```
+
+```{R}
+grid.results.3$model$params
+
+```
+
+Ok. That's too deep. And *min_child_weight* is important.
+
+```{R}
+grid.4 <- expand.grid(max_depth = c(18, 22, 28), 
+                      min_child_weight = c(3, 9, 15),
+                      gamma = c( 0.6, 1.2, 3.0, 9.0), 
+                      eta = c(.1, .3))
+```
+
+```{R}
+grid.results.4 <- grid.search(grid = grid.4, k = 3, nrounds = 12000, print_every = 10, early = 5)
+```
+
+```{R}
+grid.results.4$model$params
+```
+
+```{R}
+grid.results.4$history
+```
+
+```{R}
+chart.log(grid.results.4)
+```
+
+
+One final grid - a big one
+
+```{R}
+grid.5 <- expand.grid(eta = c(.05, .1, .3), 
+                      max_depth = c(14, 18, 22), 
+                      min_child_weight = c(6, 9, 15, 20), 
+                      gamma = c(0.3, 0.6,1.2,2.4))
+```
+
+```{R}
+grid.results.5 <- grid.search(grid = grid.5, k = 3, nrounds = 1000, print_every = 50, early = 5)
+```
+
+That was too big. Just looking at one:
+
+```{R}
+cv <- xgb.cv(data = sparse_matrix, label= response, params = list( eta = .05,
+                                                                   max_depth = 22, 
+                                                                   min_child_weight = 15, 
+                                                                   gamma = .3), 
+                              nrounds = 1000, nfold = 3,
+                             print_every_n =  10, early_stopping_rounds = 5)
+```
+```{R}
+cv$niter
+```
+
+```{R}
+cv$params
+```
+
+
+```{R}
+cv$evaluation_log %>%
+      select(iter, train_rmse_mean, test_rmse_mean) %>%
+      melt(id.vars = c("iter")) %>%
+      ggplot(aes(x = iter, y = value, color = variable)) + 
+      geom_line()
+
+```
+
+## 4. Create predictions
+
+Assuming that we have tuned parameters and a trained model - now need to apply to test set:
+
+
+
+```{R}
+
+test <- read.csv("data/test.tsv", row.names = NULL, sep = "\t")
+
+```
+```{R}
+# normalize types
+test <- normalize.data(test)
+```
+```{R}
+# split categories
+test <- split.category(test)
+```
+```{R}
+# encode the brands
+test <- brand.onehot(test)
+```
+```{R}
+# encode the condition
+test <- condition.onehot(test)
+
+```
+```{R}
+test <- shipping.binary.var(test)
+```
+```{R}
+test <- basic.text.features(test) 
+```
+```{R}
+test <- basic.text.features(test) 
+```
+```{R}
+test <- variance.words.onehot(test)
+```
+```{R}
+test <- filter.columns(test)
+```
+
+```{R}
+sparse_test <- sparse.model.matrix(test_id~.-1,test)
+```
+
+
+```{R}
+dim(test)
+
+```
+
+**SUBJECT TO CHANGE - ISOLATE BEST MODEL**
+```{R}
+set.seed(8)
+best.model = xgboost(data = sparse_matrix,label = response, max_depth = 18, min_child_weight = 9, gamma = .6, nrounds = 36, print_every_n = 10)
+```
+
+```{R}
+predict(best.model,sparse_test)
+```
+
+```{R}
+importanceRaw <- xgb.importance(feature_names = sparse_matrix@Dimnames[[2]], model = best.model, data = sparse_matrix, label = response)
+
+xgb.plot.importance(importance_matrix = importanceRaw)
+
+importanceRaw
+
+importanceRaw%>%
+      ggplot(aes(x = Feature, y = Importance)) +
+      geom_col() + 
+      coord_flip()
+
+```
+
+```{R}
+variance.words[8]
+```
+
+
+
+```{R}
+sub <- read.csv("~/Downloads/submission.csv")
+```
+
+```{R}
+sub %>% filter(price >1000) %>% 
+      inner_join(test)
+
+median(train$price)
+```
+
+```{R}
+tmp1= sample_n(train, 100)
+tmp2 = sample_n(test, 100)
+```
+
+```{R}
+tmp1 = variance.words.onehot(tmp1)
+tmp2 = variance.words.onehot(tmp2)
+```
+
+```{R}
+colnames(tmp1)[77:110]
+```
+
+```{R}
+colnames(tmp2)[76:110]
+```
+```{R}
+tmp$a <- factor(tmp$a, levels = c(2, 199), ordered = TRUE)
+```
+
+```{R}
+tmp$a
+```
+
+
+## 5. Ridge Regression
+
+```{R}
+
+```
+
+
+

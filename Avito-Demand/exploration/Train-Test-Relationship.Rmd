@@ -1,0 +1,101 @@
+---
+title: "Avito Challenge - Piecing the Training and Test Data Together"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+## 1. Introduction
+
+
+## 2. Prerequisites
+
+### 2.1 Load libraries
+
+```{R}
+# viz
+library(ggplot2)
+library(ggthemes)
+
+# data manipulation
+library(dplyr)
+
+# Data Loading
+library(readr)
+```
+
+### 2.2 Load datasets
+
+```{R}
+train = read_csv("../data/train/train.csv",locale = locale(encoding = stringi::stri_enc_get()))
+test = read_csv("../data/test/test.csv",locale = locale(encoding = stringi::stri_enc_get()))
+```
+
+
+
+## 3. Timeframes of each dataset
+
+Avito serves many thousands of ads on any given day. Thus, the dataset in this competition was created by providing only a subset of the ads served during a small time periods. 
+
+It will be important to keep in mind the temporal relationship between the training and test datasets. 
+
+```{R}
+bind_rows(
+      train %>% 
+            count(activation_date) %>%
+            mutate(dataset = "train"), 
+      test %>%
+            count(activation_date) %>%
+            mutate(dataset = "test")
+) %>%
+      ggplot(aes(x = activation_date, y = n, color = dataset)) + 
+      geom_point() + geom_line() + 
+      ggtitle("Number of datapoints in each dataset over time") + 
+      ylab("Number of datapoints") + 
+      theme_fivethirtyeight()
+      
+
+```
+
+The training data consists of datapoints from a two week period between March 14 and March 29. There are datapoints from the first couple days in April, but very few - perhaps this was a mistake in the creation of the dataset. 
+
+The test data consists of points primarily from April 12 to April 18 - over a week after the end of the training data. There is no overlap between the training and test datasets, in terms of their temporal setting. 
+
+The training data consists of data from 2 weeks, and the test data consists of one week. Thus, we can potentially observe weekly periodicity/trends in the data, but we cannot hope to observe monthly/yearly trends given our dataset. 
+
+## 4. Appearence of users
+
+```{R}
+all.data = union(
+      mutate(train, dataset = "train")%>%
+            select(-deal_probability), 
+      mutate(test,  dataset = "test")
+)
+```
+
+```{R}
+tmp = all.data %>%
+      group_by(user_id, dataset) %>%
+      summarize(num.appearences = n()) %>%
+      group_by(user_id) %>%
+      mutate(total.appearences = sum(num.appearences))
+
+tmp
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

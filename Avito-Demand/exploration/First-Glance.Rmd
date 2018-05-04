@@ -1,0 +1,291 @@
+---
+title: "Avito Demand Prediction - A First Glance"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+## 0. Prerequisites {.tabset}
+
+### 0.1 Libraries
+
+```{R}
+library(dplyr) # Data manipulation
+library(reshape2) 
+library(readr)
+library(reshape2)
+
+library(ggplot2) # viz
+library(ggthemes)
+library(grid)
+library(corrplot)
+```
+
+### 0.2 Helper functions
+
+```{R}
+# Define multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+### 0.3 Load Data
+
+```{R}
+train = read_csv("../data/train/train.csv",locale = locale(encoding = stringi::stri_enc_get()))
+```
+
+## 1. What does the data look like? 
+
+For reference, here are the first couple of rows of the data:
+
+```{R}
+head(train)
+```
+
+#### 1.1 Features and datatypes 
+
+First, taking a look at the features we have to work with, and the types of values they take on. 
+
+```{R}
+str(train)
+```
+
+The majority of our data are text data, except for the item price, activation date, and `item_seq_number.` Of course, there are also the item images, but I will ignore those in this notebook. 
+
+
+### 1.2 Missing values
+
+We can also see from the `str` command above that there are some missing values in the data. On a per-column basis:
+
+```{R}
+sapply(FUN = function(col) mean(is.na(col)),X = train)
+```
+
+Many of the columns have missing values, specifically:
+
+- param_1, param_2, and param_3 all have missing values, and get increasingly sparse. over half of the values for param_3 are missing. 
+- describption and price have 7.7% and 5.6% missing entries respectively, this may pose hallanges, as these fields will likely be important in determining if an item was purchased. 
+
+
+## 2. Univariate exploration
+
+Now, I go through each of the features in the data, and uncover their univariate properties and inconsistencies. Later, I'll spend more time uncovering relationships between the features, and correlations with the target varaible, *deal_probability*.
+
+### 2.2 Number of ad deliveries {.tabset}
+
+#### 2.2.1 Deliveries over time
+
+```{R}
+train %>%
+      count(activation_date) %>%
+      ggplot(aes(x = activation_date, y = n)) + 
+      geom_point() + geom_line() + 
+      ylab("Number of ad deliveries")+ 
+      xlab("Delivery date") + 
+      labs(title = "Number of deliveries over time")
+
+```
+
+The majority of this data is from a two week period between 2017-03-15 and 2017-03-28.
+
+This is important to keep in mind early, as the time scope of this dataset is very limited. We won't be able to ask long term questions (for example: _how many times has a user made a purchase in the past 3 years?_) using this data. 
+
+Oddly enough, there seem to be some (very sparse) data after the end of March. Perhaps the data past this date was used to create the test set, and some stragging datapoints were left behind accidentally. 
+
+### 2.2 Users {.tabset}
+
+#### 2.2.1 Repeated appearences of users
+
+First, checking out how many users appear in the dataset, and if any users appear more than once:
+
+```{R}
+# store the users' number of appearences and appearence date range in a temporary dataframe
+tmp <- train %>%
+      group_by(user_id) %>%
+      summarize(num.postings = n(), 
+             first.posting = min(activation_date), 
+             last.posting = max(activation_date)) %>%
+      mutate(posting.range = last.posting - first.posting) %>%
+      arrange(desc(num.postings))
+
+dim(tmp)
+```
+
+There are ~770,000 unique users in the training data. Since the training data has ~1,500,000 rows, this means that some users appear more than once:
+
+```{R}
+tmp %>%
+      ggplot(aes(x = num.postings)) + 
+      geom_histogram(bins = 40, fill = "magenta") + 
+      scale_x_log10(breaks = c(1,10,100, 1000)) + 
+      labs(title = "Number of appearence for each user", 
+           subtitle = "Note: x-axis is on log-scale")
+```
+
+The number of apppearences per user looks to follow a power rule, with the vast majority of users seeing only one ad. 
+
+There seems to be a few (or one) unsual use who as seen around 1000 ads. Lets take a closer look at these guys:
+
+```{R}
+train %>%
+      count(user_id, sort = TRUE)
+```
+
+It's not just one person who has many impressions, but many. Focusing on the person with the most impressions:
+
+```{R}
+train %>%
+      filter(user_id == "45ba3f23bf25") %>%
+      arrange(item_seq_number) %>%
+      select(user_id, region, city, item_seq_number, activation_date, user_type)
+```
+
+A couple things I notice when looking at this particular user:
+
+- His *user_type* is "Shop." Perhaps users of different types interact with Avito in different ways, including the number of times they see ads placed by the platform. 
+- the column *item_seq_number* is not complete. For example, in the user above, the value of this column goes from 70950 to 70952, skipping 70951.
+      - Perhaps the ad placements that are missing are those  that were extracted to form the test set. If so, this could lead do some interesting leaky features. I'll keep this in mind when it comes time to build a classifier. 
+
+### 2.2.2 Total number of impressions per user by user type
+
+The distinct user types in the data are:
+
+```{R}
+train %>%
+      count(user_type, sort = TRUE)
+```
+
+The vast majority are *Private* - probably regular users being served advertisements. The minority of users are of type *Shop* - I'm not quite sure how Avito's business works, and so I don't know eactly what this means (any ideas?).
+
+```{R}
+p1 <- train %>%
+      group_by(user_id) %>%
+      summarize(num.impressions = n(), 
+                user_type = first(user_type)) %>%
+      ggplot(aes(x = user_type, y = num.impressions, fill = user_type)) + 
+      geom_boxplot() +
+      coord_flip() +
+      scale_y_log10(breaks = c(1,10,100, 1000)) + 
+      labs(title = "Total user impressions by user type",
+           subtitle = "Note: x-axis on log scale")
+
+p1
+```
+
+Indeed, we can see that users of the *Shop* type have a higher median number of impressions/user, but it is still less than 10. What's more significantly different between *Shop* users and others is that the number of impressions/user of this type are much less positively skewed than the other types (when taken on the log scale). The vast majority of users of the other types only appear once in the dataset. 
+
+### 2.2.3 Impressions per day
+
+```{R}
+tmp2 = train %>%
+      group_by(user_id) %>%
+      summarize(num.impressions =n(), 
+                num.days.impressions = n_distinct(activation_date), 
+                user_type = first(user_type)) 
+
+p1 = tmp2 %>%
+      ggplot(aes(x = factor(num.days.impressions), y = num.impressions, fill = user_type)) +
+      geom_boxplot(position = "dodge") + 
+      scale_y_log10(breaks = c(1,10,100,1000)) + 
+      xlab("Number of days with one or more impression") + 
+      ylab("Number of impressions/user")
+
+p2 = tmp2 %>%
+      mutate(num.impressions.per.day = num.impressions / num.days.impressions) %>%
+      ggplot(aes(x = factor(num.days.impressions), y = num.impressions.per.day, fill = user_type)) + 
+      geom_boxplot(position = "dodge") + 
+      xlab("Number of days with one or more impression") + 
+      ylab("Number of impressions/user")
+
+p3 = tmp2 %>%
+      group_by(num.days.impressions, user_type) %>%
+      summarize(count = n()) %>%
+      ggplot(aes(x = num.days.impressions, y = count, fill = user_type)) + 
+      geom_col(position = "dodge") + 
+      scale_y_log10(breaks = c(1,10,100,1000,10000,100000,1000000)) + 
+      theme(legend.position = "") + 
+      xlab("Number of days with one\nor more impression") + 
+      ylab("Number of users")
+
+```
+
+```{R}
+multiplot(p1, p2, p3, layout = matrix(c(1,1,1,3,2,2,2,3), byrow = TRUE, ncol = 4))
+```
+
+These plots show the number of impressions a user sees per day, with respect to the number of days he/she has seen one or more ad in the 2 week period of the dataset. 
+
+The top left plot shows the distributions of the raw number of impressions for each user, based on the number of days the user has seen one or more ad, split by user type. 
+
+The bottom left plot shows the distributions average number of impressions for each user, based on the number of days the user has seen one or more ad, split by user type. 
+
+The right plot shows the number of users that have seen an ad on $n$ distinct days, for $n \in \{1,2,...15\}$. 
+
+What we can see is that indeed, the vast majority of users of type `private` and `company` see ads on less than 5 distinct days in the dataset. Although it is a small proportion of all the users of type `company`, a considerable number of these users see ads for 6-14 days, while almost no users of type `private` see ads for more than 7 days in the dataset. It's true that the majority of users of type `shop` see ads for 1-5 days, but it is much less uncommon for users of this type to see ads for 7-14 days, compared to the other two user types. 
+
+From the boxplots, we can see that there's a (roughly) linear increase in ad impressions with the number of days a user has seen ads - as the boxplots in the bottom left which show the average number of ads per day have roughly the same distributions for all users, regardless of how many days they have seen ads in the dataset. An exception to this is perhaps users who see ads for _all_ the days in the dataset - 14 days. We see that indeed these users see more ads/day than other users; this is especially true for users of type `shop.` Perhaps this is because these users are connected to a device that is served ads by Avito 24/7. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

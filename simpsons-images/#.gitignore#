@@ -1,0 +1,6 @@
+data/*
+*.npy
+*.Rhistory
+*.jpeg
+*.hdf5
+*.pkl
