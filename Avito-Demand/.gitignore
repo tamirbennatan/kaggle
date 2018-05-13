@@ -2,3 +2,4 @@
 *.zip
 *.Rhistory
 *.RData
+*.npy

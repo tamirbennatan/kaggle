@@ -19,9 +19,11 @@ output:
 # viz
 library(ggplot2)
 library(ggthemes)
+library(grid)
 
 # data manipulation
 library(dplyr)
+library(reshape2)
 
 # Data Loading
 library(readr)
@@ -34,7 +36,54 @@ train = read_csv("../data/train/train.csv",locale = locale(encoding = stringi::s
 test = read_csv("../data/test/test.csv",locale = locale(encoding = stringi::stri_enc_get()))
 ```
 
+### 2.3 Helper functions
 
+```{R}
+# Define multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
 
 ## 3. Timeframes of each dataset
 
@@ -83,11 +132,44 @@ tmp = all.data %>%
       group_by(user_id) %>%
       mutate(total.appearences = sum(num.appearences))
 
-tmp
+```
+```{R}
+tmp2 = tmp %>%
+      select(-total.appearences) %>%
+      dcast(user_id ~ dataset)
+
+tmp2[is.na(tmp2)] <- 0
 ```
 
+```{R}
+p1 = tmp2 %>%
+      ggplot(aes(x = train, y = test)) + 
+      geom_point(alpha = .03) + 
+      geom_smooth() + 
+      ggtitle("User appearences: train vs. test sets") + 
+      xlab("Train appearences") + 
+      ylab("Test appearences")
+```
+```{R}
+p2 = tmp2 %>%
+      select(-user_id) %>%
+      cor()  %>%
+      melt() %>%
+      ggplot(aes(x = Var1, y = Var2, fill = value, label = value)) + 
+      geom_tile() + 
+      geom_text() +
+      scale_fill_distiller(palette = "Spectral", limits = c(-1,1)) + 
+      xlab("") + ylab("") + 
+      ggtitle("Correlation - user test/train appearences")
+```
 
+```{R}
+multiplot(p1, p2, ncol = 2)
+```
 
+Indeed, the same users appear in the train and test datasets. 
+
+This will be helpful in creating "leaky" features for a regression algorithm. For example, given a test set example (which contains features such as `user_id`, and `category_name`) we can create features such as the average deal probability that a user yielded in the _training_ dataset on items of a given category. This way, we can transfer some of the information in the training set to the test set come prediction time. 
 
 
 

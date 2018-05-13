@@ -8,6 +8,12 @@ output:
     code_folding: hide
 ---
 
+## Introduction
+
+This is an extensive exploratory analysis of the training set provided for the Avito Demand Prediction challenge. I created it so that I could get a feel for what's hidden in this data, before I move on to feature engineering and model building. Hopefully it will be a good resource for you to get acquainted with the data, so that you can get started with this competition faster. 
+
+If you find this notebook helpful or have any feedback, please upvote and comment!
+
 ## 0. Prerequisites {.tabset}
 
 ### 0.1 Libraries
@@ -17,11 +23,23 @@ library(dplyr) # Data manipulation
 library(reshape2) 
 library(readr)
 library(reshape2)
+library(tidyr)
 
 library(ggplot2) # viz
 library(ggthemes)
 library(grid)
 library(corrplot)
+library(treemapify)
+library(ggridges)
+library(corrplot)
+
+library(purrr) # mapping functions
+
+library(stringr) # text processing
+library(tidytext)
+library(wordcloud)
+
+library(lubridate) # date processing
 ```
 
 ### 0.2 Helper functions
@@ -87,7 +105,7 @@ For reference, here are the first couple of rows of the data:
 head(train)
 ```
 
-#### 1.1 Features and datatypes 
+### 1.1 Features and datatypes 
 
 First, taking a look at the features we have to work with, and the types of values they take on. 
 
@@ -95,28 +113,28 @@ First, taking a look at the features we have to work with, and the types of valu
 str(train)
 ```
 
-The majority of our data are text data, except for the item price, activation date, and `item_seq_number.` Of course, there are also the item images, but I will ignore those in this notebook. 
-
+The majority of our data are text data, except for the item price, activation date, and `item_seq_number.` Of course, there are also the images, but I will ignore those for the purposes of this exploration.
 
 ### 1.2 Missing values
 
-We can also see from the `str` command above that there are some missing values in the data. On a per-column basis:
+We can also see from the `str()` command above that there are some missing values in the data. On a per-column basis:
 
 ```{R}
+# column wise proportion of missing values
 sapply(FUN = function(col) mean(is.na(col)),X = train)
 ```
 
 Many of the columns have missing values, specifically:
 
 - param_1, param_2, and param_3 all have missing values, and get increasingly sparse. over half of the values for param_3 are missing. 
-- describption and price have 7.7% and 5.6% missing entries respectively, this may pose hallanges, as these fields will likely be important in determining if an item was purchased. 
+- describption and price have 7.7% and 5.6% missing entries respectively, this may pose challanges, as these fields will likely be important in determining if an item was purchased. 
 
 
 ## 2. Univariate exploration
 
 Now, I go through each of the features in the data, and uncover their univariate properties and inconsistencies. Later, I'll spend more time uncovering relationships between the features, and correlations with the target varaible, *deal_probability*.
 
-### 2.2 Number of ad deliveries {.tabset}
+### 2.2 Number of ad deliveries 
 
 #### 2.2.1 Deliveries over time
 
@@ -135,7 +153,42 @@ The majority of this data is from a two week period between 2017-03-15 and 2017-
 
 This is important to keep in mind early, as the time scope of this dataset is very limited. We won't be able to ask long term questions (for example: _how many times has a user made a purchase in the past 3 years?_) using this data. 
 
-Oddly enough, there seem to be some (very sparse) data after the end of March. Perhaps the data past this date was used to create the test set, and some stragging datapoints were left behind accidentally. 
+After March 29, the data becomes very sparse. Perhaps data past this date was included accidentaly. 
+
+
+```{R}
+p1 = train %>%
+      filter(activation_date < "2017-03-29") %>%
+      count(activation_date) %>%
+      arrange(activation_date) %>%
+      select(n) %>%
+      acf(plot = FALSE) %>%
+      .$acf %>%
+      data.frame(auto.correlation = .) %>%
+      mutate(lag = row_number() - 1) %>%
+      ggplot(aes(x = lag, y = auto.correlation)) + 
+      geom_col() + 
+      scale_x_continuous(breaks = seq(0,11)) +
+      labs(title = "Autocorrelation - Ad frequency")
+
+p2 = train %>%
+      filter(activation_date < "2017-03-29") %>%
+      count(activation_date) %>%
+      ggplot(aes(x = activation_date, y = n)) + 
+      geom_point() + 
+      geom_line() + 
+      ylab("Number of ad deliveries")+ 
+      xlab("Delivery date") + 
+      labs(title = "Number of deliveries over time") + 
+      geom_vline(xintercept = as.Date("2017-03-20"), linetype = "dashed", color = "red") + 
+      geom_vline(xintercept = as.Date("2017-03-27"), linetype = "dashed", color = "red") 
+
+multiplot(p2, p1, cols = 2)
+```
+      
+There is some evidence of a weekly periodicity in the ad frequencies, as seen above. The autocorrelations have spikes at lags 7, and we can see that the deliveries peak on the two mondays in the datasets time window (highlighted in red).
+
+This periodic structure may be useful to model the deal probability, but we should be careful before we try to model it too explicitely - as the training data has a very limited time frame, and we may overfit very easily if we try and apply expressive techniques to model the periodicity in the data. 
 
 ### 2.2 Users {.tabset}
 
@@ -200,7 +253,7 @@ train %>%
       count(user_type, sort = TRUE)
 ```
 
-The vast majority are *Private* - probably regular users being served advertisements. The minority of users are of type *Shop* - I'm not quite sure how Avito's business works, and so I don't know eactly what this means (any ideas?).
+The vast majority are *Private* - probably regular users being served advertisements. The minority of users are of type *Shop*.
 
 ```{R}
 p1 <- train %>%
@@ -269,6 +322,814 @@ The right plot shows the number of users that have seen an ad on $n$ distinct da
 What we can see is that indeed, the vast majority of users of type `private` and `company` see ads on less than 5 distinct days in the dataset. Although it is a small proportion of all the users of type `company`, a considerable number of these users see ads for 6-14 days, while almost no users of type `private` see ads for more than 7 days in the dataset. It's true that the majority of users of type `shop` see ads for 1-5 days, but it is much less uncommon for users of this type to see ads for 7-14 days, compared to the other two user types. 
 
 From the boxplots, we can see that there's a (roughly) linear increase in ad impressions with the number of days a user has seen ads - as the boxplots in the bottom left which show the average number of ads per day have roughly the same distributions for all users, regardless of how many days they have seen ads in the dataset. An exception to this is perhaps users who see ads for _all_ the days in the dataset - 14 days. We see that indeed these users see more ads/day than other users; this is especially true for users of type `shop.` Perhaps this is because these users are connected to a device that is served ads by Avito 24/7. 
+
+
+### 2.3. Geographical Features
+
+The dataset provides the `region` and `city` in which the ad was served. Later we'll try to asses how these features relate to the `deal_probability` - but for now let's take a look at how these features are distributed.
+
+#### 2.3.1 Number of records per region/city
+
+```{R}
+train %>% count(region) %>%
+      arrange(desc(n))
+```
+There are 28 unique regions in the dataset. Taking a look as to how they're appearences are distributed:
+
+```{R}
+train %>%
+      count(region) %>%
+      rename(count = n) %>%
+      ggplot(aes(x = reorder(region, -count, FUN = min), y = count, fill = region)) +
+      geom_col() + 
+      theme(legend.position = "none",  axis.text.x  = element_text(angle=60, hjust=1, vjust=0.9)) +
+      xlab("Region") 
+```
+
+The majority of the examples come from the _Краснодарский край_ region. Ther regions are not too sparse, however, which is good. 
+
+Now, looking at the counts of the cities:
+
+```{R}
+p1 = train %>%
+      count(city, sort = TRUE) %>%
+      rename(count = n) %>%
+      mutate(city.number = row_number()) %>%
+      ggplot(aes(x = city.number, y = count, fill = count)) +
+      geom_col() + 
+      theme( legend.position = "") + 
+      xlab("City rank - by appearence frequency")
+
+p2 = train %>%
+      count(city, sort = TRUE) %>%
+      mutate(city.number = row_number()) %>%
+      mutate(proportion = cumsum(n)/sum(n)) %>%
+      ggplot(aes(x = city.number, y = proportion)) + 
+      geom_area(alpha = .6, fill = "navy") + 
+      geom_hline(yintercept = .86, linetype = "dashed", color = "red") + 
+      geom_vline(xintercept = 100, linetype = "dashed", color = "red") + 
+      xlab("City rank - by appearence frequency") + 
+      ylab("Proportion of records")
+
+
+multiplot(p1, p2, cols = 2)
+```
+
+
+When looking at the cities, we see a very strong power rule in their appearenc frequency. The top 100 cities account for 86% of the records, and then there begins a very long tail of cities which do not occur very frequently. 
+
+The sparseness in the `feature` should be noted, as it may pose challenges when building an effective classifier. If we decide to use `city` as a feature in our model, then if we leave it as is it will vastly increase the number of parameters in our model - perhaps uneccessarily. Thus, it may be wise to bin the cities in some meaningul way. More on this later. 
+
+#### 2.3.2 Region-city heirarchy
+
+One of my favorite ways to visualize heirarchical features (such as regions and cities) is with a treemap. 
+
+The treemap below works as follows: the plot region is split into gray rectangles, representing the different _regions_. The area of each gray rectangle is proportional to the number of ads served in that region in the training set. 
+
+Each gray rectangle is further split into sub-rectangles, which prepresent the cities in that region (labeled in white). 
+
+As we've seen, there are many cities which account for very few examples in the training data. Thus, the top 50 most frequently occuring region/city combinations are visualized as-is, and for all other combinations the city is casted to the group "Other."
+
+```{R}
+train %>%
+      group_by(region,city) %>%
+      count() %>%
+      ungroup() %>%
+      arrange(desc(n)) %>%
+      mutate(rank = row_number()) %>%
+      mutate(city = ifelse(rank > 50, "Other", city)) %>%
+      group_by(region, city) %>%
+      summarize(n = sum(n)) %>%
+      ggplot(aes(area = n, fill = city, label = city, subgroup = region)) +
+      geom_treemap() +
+      geom_treemap_subgroup_border() +
+      geom_treemap_subgroup_text(place = "centre", grow = T, alpha = 0.5, colour =
+                             "black", fontface = "italic", min.size = 0) +
+      geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
+      theme(legend.position = "null") +
+      ggtitle("Region-city Hierarchy")
+```
+
+We can really see the long tail of cities cominb into effect. For each region, ther are one or two cities that ccount for over half of all the examples in that region. All the other cities combined (labeled "Other") account for less than half - as there are hundreds of cities in the dataset that do not yield many training examples. 
+
+
+### 2.4 Categories and sub-categories
+
+Again, the features `parent_category_name` and `category_name` are hierarchical features. These are more interesting than the region/city in which the ad was delivered, however, because they give us an idea of what the ad is about. 
+
+#### 2.4.1 Parent categories
+
+```{R}
+p1 = train %>%
+      count(parent_category_name) %>%
+      ggplot(aes(x = reorder(parent_category_name, n, FUN = min), y = n, fill = parent_category_name)) + 
+      geom_col() + 
+      theme(legend.position = "none", axis.text.y  = element_text(angle=60, hjust=1, vjust=0.9)) + 
+      xlab("Parent Category") + ylab("Frequency") +
+      coord_flip()
+```
+```{R}
+p2 = train %>% 
+      group_by(parent_category_name) %>%
+      mutate(frequency = n()) %>%
+      ungroup() %>%
+      filter(!is.na(price)) %>%
+      mutate(price = price + .1) %>%
+      ggplot(aes(x = price, y = reorder(parent_category_name, frequency, FUN = min) , fill = parent_category_name))  +
+      geom_density_ridges() +
+      theme(legend.position = "") + 
+      scale_x_log10() + 
+      ylab("Parent Category") + xlab("Price (log-scale)")
+```
+```{R}
+multiplot(p2, p1, layout = matrix(c(1,1,2,1,1,2), byrow = TRUE, ncol = 3))
+```
+
+The most frequently occuring category is _Личные вещи_, which means "personal things." The other categories drop off rather quickly - perhaps the "personal things" category serves as a sort of "Other" bin. 
+
+Above we also see the price distributions for each of the different categories. It looks like some categories, like _Недвижимость_ (property) are more expensive than others, like _Услуги_ (services). How these prices affect the deal probability, we'll investigate later.
+
+Note that in the densities above, the price is on a log scale. Thus, the prices seem to be very positively skewed across the board. We also see that in the _Услуги_ and _Животные_ categories, there are many examples with near zero (or perhaps zero) prices. We'll investigate this further in the next section. 
+
+
+Using the `nest()` function from `tidyr`, and the `map()` function from `purrr`, we can recreate the ACF and time series plots shown in section 2.2.1, split by `parent_category_name`.
+
+
+```{R, fig.height = 10}
+p1 = train %>%
+      count(activation_date, parent_category_name) %>%
+      filter(activation_date <= "2017-03-28") %>%
+      ggplot(aes(x = activation_date, y = n, color = parent_category_name)) + 
+      geom_point(show.legend = FALSE) + 
+      geom_line(show.legend = FALSE) + 
+      facet_grid(parent_category_name ~., scales = "free") + 
+      labs(title = "Category frequency series")
+```
+```{R}
+
+extract.acf <- function(nested) {
+       nested %>%
+            arrange(activation_date) %>%
+            select(n) %>%
+            acf(plot = FALSE) %>%
+            .$acf %>%
+            data.frame(acf = .) %>%
+            mutate(lag = row_number() -1)
+}
+p2 = train %>%
+      filter(activation_date <= "2017-03-28") %>%
+      count(activation_date, parent_category_name) %>%
+      group_by(parent_category_name) %>%
+      nest() %>% 
+      mutate(acf = map(.x = data, .f = extract.acf)) %>%
+      select(-data) %>%
+      unnest() %>%
+      ggplot(aes(x = lag, y = acf, fill = parent_category_name)) +
+      geom_col(show.legend = FALSE) +
+      facet_grid(parent_category_name ~.) + 
+      labs(title = "Category frequency ACF")
+```
+
+```{R, fig.height = 10}
+multiplot(p1,p2,cols = 2)
+```
+
+Indeed, the frequency of ad deliveries show a weekly periodic structure across each of the parent categories. The shape varies slighly across parent categories - as some appear to have peak deliveries on Sunday while others have peak deliveris on Mondays, but overall the shapes are similar. 
+
+
+#### 2.4.2 Subcategories
+
+There are 47 subcategories (found in the `category_name`) column. The most common categories are _Одежда, обувь, аксессуары_ (clothes, shoes & accessories) and _Детская одежда и обувь_ (childrens clothes & footwear). 
+
+```{R}
+p1 = train %>%
+      count(category_name, sort = TRUE) %>%
+      rename(frequency = n) %>%
+      ggplot(aes(x = reorder(category_name, frequency, fun = min), y = frequency, fill = category_name)) + 
+      geom_col(show.legend = FALSE) + 
+      coord_flip() + 
+      xlab("Category")
+
+p2 = train %>%
+      count(category_name, sort = TRUE) %>%
+      mutate(category.rank = row_number()) %>%
+      mutate(proportion = n/sum(n)) %>%
+      mutate(cumulative.proportion = cumsum(proportion)) %>%
+      ggplot(aes(x = category.rank, y = cumulative.proportion)) +
+      geom_area(fill = "navy", alpha = .4) + 
+      geom_hline(yintercept = .9, linetype = "dashed", color = "red") + 
+      geom_vline(xintercept = 25, linetype = "dashed", color = "red") + 
+      ylab("Cumulative propotion of training examples") + 
+      xlab("Category rank (by frequency)")
+
+multiplot(p1, p2, cols = 2, layout = matrix(c(1,1,1,2,2,1,1,1,2,2), byrow = TRUE, ncol = 5))
+```
+
+Again, we aboserve a clear long tail in the categories. The top 25 categories account for 90% of the training examples. 
+
+---
+
+Looking at how the categories are distributed amongst the parent categories with a treemap:
+
+```{R}
+train %>%
+      group_by(parent_category_name,category_name) %>%
+      count() %>%
+      ggplot(aes(area = n, fill = category_name, label = category_name, subgroup = parent_category_name)) +
+      geom_treemap() +
+      geom_treemap_subgroup_border() +
+      geom_treemap_subgroup_text(place = "centre", grow = T, alpha = 0.5, colour =
+                             "black", fontface = "italic", min.size = 0) +
+      geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
+      theme(legend.position = "null") +
+      ggtitle("Parent-category/sub-category hierarchy.")
+```
+
+We can see that the categories are pretty evenly distriuted amongst the parent categories. Each parent category has between 1 and 9 sub categories, and (with few exceptions) there are no categories which account for the overwhelming majority of examples within a given parent category. 
+
+
+### 2.5 Text features
+
+The features `title` and `item_description` are likely important in predicting the deal probability, as they directly describe the ad at hand. 
+
+Text features are difficult to work with, as token frequencies are sparse, leading to models with high dimensionalities. In this section, I'll take a quick look at the properties and  vocabulary that make up these two columns Later, we'll work to engineer features that can be used for a learning algorithm. 
+
+#### 2.5.1 Title and description length
+
+From my past experience, simple features such as word/character counts can be useful in various prediction tasks that involve text data. Thus I'll start by looking at the word/character counts in the `title` and `description` columns. 
+
+```{R}
+p1 = train %>%
+      mutate(word.count = str_count(title, "\\w+") + 1) %>%
+      ggplot(aes(x = word.count)) + 
+      geom_histogram() + 
+      labs(title = "Title word count")
+
+p2 = train %>%
+      mutate(character.count = str_count(title)) %>%
+      ggplot(aes(x = character.count)) + 
+      geom_histogram() + 
+      labs(title = "Title character count")
+
+p3 = train %>%
+      mutate(word.count = str_count(description, "\\w+") + 1) %>%
+      ggplot(aes(x = word.count)) + 
+      geom_histogram() + 
+      labs(title = "Description word count")
+
+p4 =  train %>%
+      mutate(character.count = str_count(description)) %>%
+      ggplot(aes(x = character.count)) + 
+      geom_histogram() + 
+      labs(title = "Description character count")
+
+multiplot(p1,p2,p3,p4, layout = matrix(c(1,2,3,4), byrow =TRUE, ncol = 2))
+```
+
+We can see that the word/character count of the title is much smaller and more evenly distributed than the word/character counts of the descriptions. It looks like there is a strict character limit on the title at 50 characters enforced by Avito, as this is the maximum number of characters in any title, and there are many examples with _exactly_ 50 characters. 
+
+```{R}
+p5 = train %>%
+      mutate(word.count = str_count(description, "\\w+") + 1) %>%
+      ggplot(aes(x = word.count)) + 
+      geom_histogram() + 
+      labs(title = "Description word count") +
+      scale_x_log10() + 
+      xlab("Word count (log scale)")
+      
+
+p6 =  train %>%
+      filter(!is.na(description)) %>%
+      mutate(character.count = str_count(description) + 1) %>%
+      ggplot(aes(x = character.count)) + 
+      geom_histogram() + 
+      labs(title = "Description character count") + 
+      scale_x_log10() + 
+      xlab("Word character (log scale)")
+
+multiplot(p5, p6, cols = 2)
+```
+
+The word and character counts of the descriptions look prety nice - in fact, the description character count looks to be very well approximated by a log-normal distribution. Perhaps applying this transformation will be helpful if we want to use a the description word/character counts as features. 
+
+#### 2.5.2 Tf-Idf weights
+
+A common way to summarize the contents of a document of text is to look at the frequency of different tokens in the document, for example via wordclouds:
+
+```{R}
+# count the tokens in the titles
+title.word.frequency = train %>%
+      unnest_tokens(word, title) %>%
+      count(word)
+
+# wordcloud of title words
+title.word.frequency %>%
+      filter(!str_detect(word, "[0-9]")) %>%
+      top_n(50, n) %>%
+      with(wordcloud(word, n, color = c("red4", "black", "darkblue")))
+
+# save some memory
+rm(title.word.frequency)
+```
+
+The trouble is some of the most commonly occuring words are stopwords (e.g. _the_, _of_, _a_), which don't provide a good summary of the content of a text document. Usually, one would simply remove stopwords, but since the documents in this datasets are in Russian, and I don't know of any easily accessible Russian stopword dictionaries, we cannot easily remove stopwords. 
+
+Instead, we can use Tf-Idf weights to model the "importance" of a word to a document or a set of documents. The Tf-Idf weight of a word is high if:
+
+1. The word occurs frequently in a document
+2. The word occurs in few documents in the entire corpus. 
+
+This way, words that appear in almost all documents (like _the_) are penalized.
+
+To demonstrate this technique, consider grouping the titles of the ads by the parent category `parent_category_name`. In other words, all the titles of ads with the same category are considered part of the same document. Visualizing the top-10 words (in terms of Tf-Idf) in each category:
+
+```{R, fig.height = 12}
+title.category.tf_idf <- train %>%
+      unnest_tokens(word, title) %>%
+      count(parent_category_name, word) %>%
+      bind_tf_idf(word, parent_category_name, n)
+
+title.category.tf_idf %>% 
+      group_by(parent_category_name) %>%
+      top_n(10, tf_idf) %>%
+      ungroup() %>%
+      ggplot(aes(x = word, y = tf_idf, fill = parent_category_name)) +
+      geom_col(show.legend = FALSE) +
+      facet_wrap(~parent_category_name, ncol = 1, scales = "free") + 
+      coord_flip()
+```
+
+The result actually makes a lot of sense. In the _Бытовая электроника_ category (consumer electronics), the words with the highest Tf-Idf are _16gb_, _samsung_, _lenovo_, etc., - words clearly relating to electronics. In the _Для дома и дачи_ category (for home and cottages), the words with the highest Tf-Idf are _washing_, _sofa_, _drawers_, _door_, etc. 
+
+So, it seems like Tf-Idf weights are an effective way to extract the words that are "representative" of the documents in a group. This is not particularly useful when we group by the parent category, as we can simply use the category itself as a feature instead of the words that appear in that category. This technique will become useful for feature engineering, however, once we start grouping ads together based on their deal probabilities. 
+
+### 2.6 Price
+
+```{R}
+train %>%
+      ggplot(aes(x = price)) + 
+      geom_density() +
+      scale_x_log10() +
+      ggtitle("Prices (log-scale)")
+```
+
+Prices are very positively skewed - most prices range between 100 and 10,000, but some reach the millions or even billions. 
+
+Taking a look at how the prices vary by category:
+
+```{R}
+p1 = train %>%
+      filter(!is.na(price)) %>%
+      mutate(price = price + 1) %>%
+      ggplot(aes(x = price, y = parent_category_name, fill = parent_category_name)) + 
+      geom_density_ridges(show.legend = FALSE) + 
+      scale_x_log10()
+```
+
+```{R}
+p2 = train %>% 
+      group_by(region, parent_category_name) %>%
+      summarize(median.price = median(price, na.rm = T)) %>%
+      ggplot(aes(x = region, y = parent_category_name, fill = median.price)) + 
+      geom_tile() +
+      scale_fill_distiller(palette = "Spectral") + 
+      theme(axis.text.x  = element_text(angle=60, hjust=1, vjust=0.9))
+```
+
+```{R, fig.height = 12}
+multiplot(p1,p2)
+```
+
+
+
+```{R}
+p1
+```
+
+It looks like two categories have substatially higher prices: _Недвижимость_ (property) and _Транспорт_ (transport). 
+
+Interestingly, by inspection of the median price per region/category combination, it looks like for the _Недвижимость_ category, the price varies by region. I first suspected that this was because the data for some region/category combinations are very sparse, but after looking at the number of records per region for ads with category _Недвижимость_ and observing that the data is not very sparse, I see thre may be an interaction between price and region. 
+
+```{R}
+train %>%
+      filter(parent_category_name == "Недвижимость") %>%
+      count(region) %>%
+      rename(frequency = n) %>%
+      ggplot(aes(x = region, y = frequency)) + 
+      geom_col() + 
+      coord_flip() + 
+      ggtitle("Frequency of regions for ads with category Hедвижимость")
+```
+
+
+
+It also looks like the prices may be higher on average for ads shown to users of type "shop"
+
+```{R}
+p0 = train %>%
+      ggplot(aes(x = user_type, y = price, fill = user_type)) + 
+      geom_boxplot(show.legend = FALSE) + 
+      scale_y_log10()
+```
+
+```{R}
+tmp = train %>%
+      filter(!is.na(price)) %>%
+      group_by(user_type, parent_category_name) %>%
+      summarize(count = n(), 
+               median.price = median(price))
+
+p1 = tmp %>%
+      ggplot(aes(x = parent_category_name, y = user_type, fill = median.price, label = median.price)) + 
+      geom_tile() +
+      scale_fill_distiller(palette = "Spectral") + 
+      theme(axis.text.x  = element_text(angle=60, hjust=1, vjust=0.9)) + 
+      geom_text(color = "white")
+
+p2 = tmp %>%
+      ggplot(aes(x = parent_category_name, y = user_type, fill = count, label = count)) + 
+      geom_tile() + 
+      theme(axis.text.x  = element_text(angle=60, hjust=1, vjust=0.9)) + 
+      geom_text(color = "white")
+
+p3 = train %>% 
+      filter(!is.na(price)) %>%
+      mutate(price = price + 1) %>%
+      ggplot(aes(x = price, y = user_type, fill = parent_category_name)) + 
+      geom_density_ridges(show.legend = FALSE) + 
+      facet_wrap(~parent_category_name) + 
+      scale_x_log10()
+
+```
+
+```{R, fig.width = 10}
+layout = matrix(c(1,2,2,1,2,2,4,3,3,4,3,3), byrow = TRUE, ncol = 3)
+multiplot(p0, p1, p2, p3, layout =layout)
+```
+
+Interestingly, it looks like the relatively high prices of the property category are in indeed being driven by the users of type "shop" (or vice-versa).
+
+Looking at the densities of the prices, split by user type and category, provides a rough explanation. The prices of items in the property category are bimodal, with a sharp peak at a very expensive price. It turns out that a large proportion of the users of type _Shop_ that are served ads from this category are served ads with prices at this high extreme, increasing the mean/median price for ads served to users of type _Shop_ as whole. 
+
+### 2.7 Images and `image_top_1`
+
+Two features in the training data relate to images - the image id and the feature `image_top_1`. 
+
+Around 93% of the ads have an associated image id - those that have a non-missing image id also have a non-missing value for `image_top_1`. 
+
+The data description on Kaggle says that this feature is "Avito's classification code for the image" - thus, I'm inclined to believe its a categorical variable, as opposed to a continuous/ordinal one. 
+
+```{R}
+train %>%
+      count(image_top_1) %>% 
+      ggplot(aes(x = image_top_1, y = n)) + 
+      geom_col()
+```
+
+After looking at the distribution of of the values of *image_top_1* the question arises - does the nominal value of an ads *image_top_1* features have any meaning? Are a certain subset of ads assigned similar values of image_top_1, or is the value independent of other features?
+
+If we look at the makeup of *image_top_1* values across different product categores, we can certainly see that there is some relationship between the two features. 
+
+```{R}
+train %>%
+      count(parent_category_name, image_top_1) %>%
+      ggplot(aes(x = image_top_1, y = n, group = parent_category_name, fill = parent_category_name)) +
+      geom_area(position = "fill") +
+      ggtitle("Proportion of `image_top_1` by parent category")
+```
+
+See how the values of *image_top_1* are "clustered" amongst ads of the same category? This is a relationship. For demonstration, contrast this with the distribution of *image_top_1* amongst different geographical regions:
+
+
+```{R}
+train %>%
+      count(region, image_top_1) %>%
+      ggplot(aes(x = image_top_1, y = n, group = region, fill = region)) +
+      geom_area(position = "fill") +
+      ggtitle("Proportion of `image_top_1` by region")
+```
+
+These evenly distributed bands, whose thickness is proportional to the frequency of each geographical region, shows that the value of *image_top_1* does not relate to the geographical region. 
+
+This makes me think that it could be useful to experiment with *image_top_1* as a nominal feature in my model.
+
+
+---
+
+## 3. Relationships with target: `deal_probability`.
+
+Phew! We've now that we've gone through the due dilligence of glancing through our the data variable by variable, its time to focus on the important stuff - the target variable!
+
+```{R}
+train %>%
+      ggplot(aes(x = deal_probability)) + 
+      geom_density(fill = "navy", ) + 
+      ggtitle("Distribution of deal probability values") 
+```
+
+It looks like the majority of ads get a zero probability - around 40%. Then there are two areas of slighly higher weight - between 1%-25%, and again between 70%-80%. 
+
+So, a priori, we should expect the deal probability to be low. In fact, if we were to simply use the sample average of 13.91% for all examples (the OLS estimate), we would yield a trainign RMSE of .2600 - which is not _horrible_. 
+
+```{R}
+print(paste("Sample average:", mean(train$deal_probability)))
+sqrt(mean((train$deal_probability - mean(train$deal_probability))^2))
+```
+
+To improve from this naive baseline, we need to ind factors with which we can refine our prior belief that the deal probability is low. Lets get started. 
+
+```{R}
+train %>% 
+      group_by(user_id) %>% 
+      arrange(activation_date, item_seq_number) %>%
+      mutate(ord = row_number()) %>%
+      mutate(prev_prob = lag(deal_probability, n = 1, order_by(ord)),
+             prev2_prob = lag(deal_probability, n = 2, order_by(ord))) %>%
+      select(deal_probability, prev_probco) %>%
+      cor(use = "pairwise.complete.obs")
+```
+
+
+### 3.1 Temporal features
+
+In section 2.2, we saw that there is a weekly periodic structure in the number of impressions. Thus, the first thing I'll investigate is the variation in the deal probability over the coures of a week. 
+
+```{R}
+# add the day of the week as a factor feature
+train$dow <- wday(train$activation_date, label = TRUE)
+```
+```{R}
+p1 = train %>%
+      ggplot(aes(x = deal_probability, fill = parent_category_name)) + 
+      geom_histogram(show.legend = FALSE) + 
+      facet_wrap(~dow, ncol = 2)
+
+p2 = train %>% 
+      count(dow) %>%
+      ggplot(aes(x = dow, y = n, fill = "turquoise")) + 
+      geom_col(show.legend = FALSE) + 
+      coord_flip()
+
+p3 = train %>% 
+      count(parent_category_name) %>%
+      ggplot(aes(x = parent_category_name, y = n, fill = parent_category_name)) + 
+      geom_col(show.legend = FALSE) + 
+      coord_flip()
+
+multiplot(p1, p2, p3, layout = matrix(c(1,1,1,2,2,1,1,1,2,2,1,1,1,3,3,1,1,1,3,3), byrow = TRUE, ncol = 5))
+```
+
+The distribution of the deal probability looks spretty much the same over the course of the week. Perhaps if we furhter split it by category, structure in the day of the week may present itself. 
+
+```{R, fig.height = 10, fig.width = 10}
+train %>%
+      ggplot(aes(x = deal_probability)) + 
+      geom_histogram(show.legend = FALSE, fill = "blue") + 
+      facet_grid(parent_category_name~dow, scales = "free_y")
+```
+
+In this graph, looking a cross a row corresponds to looking across the days of the week, and down a column to looking across the different categories. 
+
+Again, when we look across the rows we don't see a real affect of the day of the week on the distribution of the deal probabilities, split by categories. 
+
+On the other hand, the distributions of the deal probabilities are very different across the different categories. Some are extremely bimodal (bottom row), while others are more uniform (second to last row). 
+
+Perhaps what's more important than the day of the week in which an ad is seen is the number of ads the person has seen already that week, or in the dataset itself.
+
+---
+
+Below I construct a bunch of features which try to capture any correlation between the `deal_probability` and a user's activity in the training data up to that point. For example, is the deal probability correlated to the number of ads a user has seen up to that point? Up to that point in the current week? Or perhaps the highest probability that user has yielded up to that point? These types of questions rely heavily on window functions such as `lag()` and `cummsum()`, which are a breeze to use using the `dplyr` library. 
+
+First, I'll shift the feature `item_seq_number` so that it starts at 0 for each user, and increments from there. I'll also add the week the ad was delivered on, for future use.
+
+```{R}
+train <- train %>%
+      group_by(user_id) %>%
+      mutate(first_seq_number = min(item_seq_number)) %>%
+      mutate(shifted_seq_number = item_seq_number - first_seq_number) %>%
+      ungroup() %>%
+      mutate(week = week(activation_date))
+```
+
+Now, adding the total number of times a user appears in the training data:
+
+```{R}
+train <- train %>%
+      group_by(user_id) %>%
+      mutate(num_appearences = n()) %>%
+      ungroup()
+```
+
+Further, for each user, add the number of times he/she has seen an ad on a given week, a given day.
+
+```{R}
+train <- train %>%
+      group_by(user_id, activation_date) %>%
+      mutate(num_appearences_today = n()) %>%
+      group_by(user_id, week) %>%
+      mutate(num_appearences_week = n()) %>%
+      ungroup()
+```
+
+Now, what are the highest/lowest `deal_probabilities` associated with a user so far (not including the current ad delivery)?
+
+```{R}
+train <- train %>%
+      group_by(user_id) %>%
+      arrange(item_seq_number) %>%
+      mutate(highest_prob_sofar = cummax(deal_probability), 
+             lowest_prob_sofar = cummin(deal_probability)) %>%
+      mutate(highest_prob_sofar = lag(highest_prob_sofar, n = 1, order_by = item_seq_number),
+             lowest_prob_sofar = lag(lowest_prob_sofar, n = 1, order_by = item_seq_number))
+```
+
+What are the highest/lowest probabilities a user has seen in the current day? Current week? 
+
+```{R}
+# add the highest/lowest probs this week and day
+train <- train %>%
+      group_by(user_id, activation_date) %>%
+      arrange(item_seq_number) %>%
+      mutate(highest_prob_today = cummax(deal_probability),
+             lowest_prob_today = cummin(deal_probability)) %>%
+      mutate(highest_prob_today = lag(highest_prob_today, n = 1, order_by = item_seq_number),
+             lowest_prob_today = lag(lowest_prob_today, n = 1, order_by = item_seq_number)) %>%
+      ungroup() %>%
+      group_by(user_id, week) %>%
+      arrange(item_seq_number) %>%
+      mutate(highest_prob_week = cummax(deal_probability), 
+             lowest_prob_week = cummin(deal_probability)) %>%
+      mutate(highest_prob_week = lag(highest_prob_week, n = 1, order_by = item_seq_number),
+             lowest_prob_week = lag(lowest_prob_week, n = 1, order_by = item_seq_number)) %>%
+      ungroup()
+```
+
+What is the highest probability the user has seen so far in the current category?
+
+```{R}
+train <- train %>%
+      group_by(user_id, parent_category_name) %>%
+      arrange(item_seq_number) %>%
+      mutate(highest_prob_category = cummax(deal_probability), 
+             lowest_prob_category = cummin(deal_probability)) %>%
+      mutate(highest_prob_category = lag(highest_prob_category, n = 1, order_by = item_seq_number),
+             lowest_prob_category = lag(lowest_prob_category, n = 1, order_by = item_seq_number)) %>%
+      ungroup()
+```
+
+Now, how are these things correlated to the target, `deal_probability`?
+
+```{R}
+train %>%
+      select(deal_probability, highest_prob_sofar, lowest_prob_sofar, 
+             highest_prob_today, lowest_prob_today, 
+             highest_prob_week, lowest_prob_week,
+             highest_prob_category, lowest_prob_category, 
+             num_appearences_week, num_appearences_today,
+             num_appearences_category_sofar, num_appearences_category_week,
+             num_appearences_category_today,
+             item_seq_number, shifted_seq_number) %>%
+      cor(use = "pairwise.complete.obs") %>%
+      corrplot(method = "number", type = "lower")
+```
+
+There appears to be some weak correlation between the target variable and some of these engineered features, expecially the ones that concern the highest/lowest probability encountered by a user in a curren time frame. 
+
+Note that these type of windowing features produce `NA` values, and the correlation matrix above removes such values. For example, when calculating the maximum probability produced by a user up until now, if a row corresponds to the first appearence of a user in the training data, an `NA` value will be produced.
+
+Since the frequency of these `NA` values depends on the sparsity of the data used in the correlation computation, and the sparsity depends on the item category (as we've seen), I'd expect that if we produce such a matrix for the data associated with each item category, we'd see different results:
+
+
+```{R}
+cormelt <- function(df){
+      df %>%
+            cor(use = "pairwise.complete.obs") %>%
+            melt()
+}
+
+train %>%
+       select(deal_probability, parent_category_name,
+             highest_prob_sofar, lowest_prob_sofar, 
+             highest_prob_today, lowest_prob_today, 
+             highest_prob_week, lowest_prob_week,
+             highest_prob_category, lowest_prob_category, 
+             num_appearences_week, num_appearences_today,
+             num_appearences_category_sofar, num_appearences_category_week,
+             num_appearences_category_today,
+             item_seq_number, shifted_seq_number) %>%
+      group_by(parent_category_name) %>%
+      nest() %>%
+      mutate(cordf = map(.x = data, .f = cormelt)) %>%
+      unnest(cordf) %>%
+      mutate(correlation = value) %>%
+      ggplot(aes(x = Var1, y = Var2, fill = correlation)) +
+      facet_wrap(~parent_category_name) + 
+      geom_tile() + 
+      scale_fill_distiller(palette = "Spectral") + 
+      theme(axis.text.x  = element_text(angle=45, hjust=1, vjust=0.9)) 
+
+```
+
+```{R}
+train = train %>%
+      mutate(prob_group = case_when(
+            deal_probability == 0 ~ "zero probability",
+            (deal_probability > 0) & (deal_probability < .27) ~ "low probability", 
+            between(deal_probability, .27, .7) ~ "mid probability", 
+            deal_probability > .7 ~ "high probability"))
+
+train %>%
+      ggplot(aes(x = deal_probability, fill = prob_group)) +
+      geom_histogram()
+```
+
+Number of days since sell of high probability:
+
+```{R}
+high_probs <- train %>%
+      filter(prob_group == "high probability") %>%
+      group_by(user_id) %>%
+      mutate(prev_high_date = lag(activation_date, n = 1, order_by = item_seq_number)) %>%
+      mutate(prev_high_presence = !is.na(prev_high_date),
+             days_since_high = activation_date - prev_high_date)
+```
+
+
+```{R}
+train <- train %>%
+      left_join(
+            train %>%
+                  left_join(
+                        train %>%
+                              filter(prob_group == "high probability") %>%
+                              select(user_id, activation_date, item_seq_number, deal_probability),
+                        by = c("user_id")
+                  ) %>%
+                  select(user_id, activation_date.x, activation_date.y,item_seq_number.x, item_seq_number.y, deal_probability.x, deal_probability.y) %>%
+                  filter(activation_date.x >= activation_date.y & item_seq_number.x > item_seq_number.y) %>%
+                  group_by(user_id, item_seq_number.x) %>%
+                  top_n(1, activation_date.y) %>%
+                  top_n(1, item_seq_number.y) %>%
+                  rename(item_seq_number = item_seq_number.x, activation_date = activation_date.x),
+            by = c("user_id", "activation_date", "item_seq_number")
+      ) %>%
+      mutate(days_since_high = activation_date - activation_date.y, 
+             seqs_since_high = item_seq_number - item_seq_number.y) %>%
+      select(-activation_date.y, item_seq_number.y, deal_probability.x, deal_probability.y)
+```
+
+
+
+```{R}
+train %>%
+      left_join(
+            train %>%
+                  left_join(
+                        train %>%
+                              filter(prob_group == "zero probability") %>%
+                              select(user_id, activation_date, item_seq_number, deal_probability),
+                        by = c("user_id")
+                  ) %>%
+                  select(user_id, activation_date.x, activation_date.y,item_seq_number.x, item_seq_number.y, deal_probability.x, deal_probability.y) %>%
+                  filter(activation_date.x >= activation_date.y & item_seq_number.x > item_seq_number.y) %>%
+                  group_by(user_id, item_seq_number.x) %>%
+                  top_n(1, activation_date.y) %>%
+                  top_n(1, item_seq_number.y) %>%
+                  rename(item_seq_number = item_seq_number.x, activation_date = activation_date.x),
+            by = c("user_id", "activation_date", "item_seq_number")
+      ) %>%
+      mutate(days_since_high = activation_date - activation_date.y, 
+             seqs_since_high = item_seq_number - item_seq_number.y) %>%
+      select(-activation_date.y, item_seq_number.y, deal_probability.x, deal_probability.y)
+```
+
+Get the previous probability
+
+
+```{R}
+train %>% 
+      arrange(desc(num_appearences))
+```
+
+```{R}
+train %>%
+      filter(user_id == "45ba3f23bf25") %>%
+      group_by(user_id) %>%
+      arrange(item_seq_number) %>%
+      mutate(prev_probability = lag(deal_probability, n = 1, order_by = item_seq_number)) %>%
+      mutate(dummy = 1) %>%
+      mutate(rolling_avg_probability = (cumsum(deal_probability) - deal_probability)/(cumsum(dummy) - 1)) %>%
+      ungroup() %>%
+      arrange(item_seq_number) %>% 
+      select(deal_probability, prev_probability, rolling_avg_probability)
+      
+```
+
+
+
+
+
+
 
 
 

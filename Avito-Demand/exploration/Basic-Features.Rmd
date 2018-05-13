@@ -1,0 +1,304 @@
+---
+title: "Basic Feature Extraction"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+# Basic Feature Extraction
+
+In this notebook, I perform basic feature extraction, with no explanation of their motivation. For an in depth explanation of where these features came from, see my exporatory analysis:
+
+## 0. Load Libraries and data
+
+### 0.1 Required libraries
+
+```{R}
+# data manipulation 
+library(dplyr)
+library(reshape2) 
+library(readr)
+library(reshape2)
+library(tidyr)
+# text processing
+library(stringr) 
+# date manipulation
+library(lubridate)
+# plotting
+library(ggplot2)
+```
+
+### 0.2 Load data
+
+I'll be performing the same transormations to the train and test dataset, so that I can apply the models trained on the training data to the test data
+
+```{R}
+df_train <- read_csv("../data/train/train.csv", locale = locale(encoding = stringi::stri_enc_get()))
+df_test  <- read_csv("../data/test/test.csv", locale = locale(encoding = stringi::stri_enc_get()))
+```
+
+
+## 1. Time series/temporal features
+
+Previous probability yielded by a user, and the one before that as well. 
+
+The number of days ago the previous  appearence of the user was
+
+```{R}
+prev_appearences <- function(df){
+      df %>%
+            group_by(user_id) %>%
+            mutate(previous_appearence =  lag(activation_date, n = 1, order_by = item_seq_number),
+                   previous2_appearence = lag(activation_date, n = 2, order_by = item_seq_number)) %>%
+            ungroup() %>%
+            mutate(days_since_previous_appearence = activation_date - previous_appearence, 
+                   days_since_previous_appearence2 = activation_date - previous2_appearence) %>%
+            select(-previous_appearence, -previous2_appearence)
+}
+```
+
+```{R}
+df_train <- prev_appearences(df_train)
+df_test <- prev_appearences(df_test)
+```
+
+Now, calculate a rolling average of the number of appearences of a user per day, not including the current day. 
+
+
+```{R}
+test_counts <- df_test %>%
+      count(user_id, activation_date) %>%
+      group_by(user_id) %>%
+      arrange(activation_date) %>%
+      mutate(avg_appearences_day = cummean(n)) %>%
+      mutate(tomorrow = activation_date + 1)
+
+train_counts <- df_train %>%
+      count(user_id, activation_date) %>%
+      group_by(user_id) %>%
+      arrange(activation_date) %>%
+      mutate(avg_appearences_day = cummean(n)) %>%
+      mutate(tomorrow = activation_date + 1)
+```
+```{R}
+df_train <- df_train %>%
+      left_join(
+            train_counts %>%
+                  select(user_id, tomorrow, avg_appearences_day), 
+            by = c("user_id" = "user_id", "activation_date" = "tomorrow")
+      ) %>%
+      rename(avg_appearences_per_day_prev = avg_appearences_day)
+```
+
+
+```{R}
+df_test <- df_test %>%
+      left_join(
+            test_counts %>%
+                  select(user_id, tomorrow, avg_appearences_day), 
+            by = c("user_id" = "user_id", "activation_date" = "tomorrow")
+      ) %>%
+      rename(avg_appearences_per_day_prev = avg_appearences_day)
+```
+
+
+And the number of appearences the user has had in the current day
+
+```{R}
+df_train <- df_train %>% 
+      group_by(user_id, activation_date) %>%
+      mutate(daily_ad_number = min_rank(item_seq_number)) %>%
+      ungroup()
+```
+
+```{R}
+df_test <- df_test %>% 
+      group_by(user_id, activation_date) %>%
+      mutate(daily_ad_number = min_rank(item_seq_number)) %>%
+      ungroup()
+```
+
+And now, number of ads the user has seen in the current day _from the same parent category_.
+
+```{R}
+df_train <- df_train %>%
+      group_by(user_id, activation_date, parent_category_name) %>%
+      mutate(daily_ad_number_category = min_rank(item_seq_number)) %>%
+      ungroup()
+```
+
+```{R}
+df_test <- df_test %>%
+      group_by(user_id, activation_date, parent_category_name) %>%
+      mutate(daily_ad_number_category = min_rank(item_seq_number)) %>% 
+      ungroup()
+```
+
+## 2. Frequency mapping
+
+Now, mapping categorical features with many levels to frequency counts:
+
+Starting with the city:
+
+```{R}
+city_freq_mapping <- df_train %>%
+      count(city) %>%
+      union_all(
+            df_test %>%
+                  count(city)
+      ) %>%
+      group_by(city) %>%
+      summarize(city_count = sum(n)) %>%
+      ungroup() %>%
+      mutate(city_frequency = city_count/sum(city_count)) %>%
+      select(city, city_frequency)
+```
+
+
+```{R}
+df_train <- df_train %>%
+      left_join(city_freq_mapping)
+
+df_test <- df_test %>%
+      left_join(city_freq_mapping)
+
+```
+
+And *param_1*
+
+```{R}
+param_1_freq_mapping = df_train %>%
+      count(param_1) %>%
+      union_all(
+            df_test %>%
+                  count(param_1)) %>%
+      group_by(param_1) %>%
+      summarize(num_param_1 = sum(n)) %>%
+      ungroup() %>% 
+      mutate(param_1_freq = num_param_1/sum(num_param_1)) %>%
+      select(param_1, param_1_freq)
+```
+
+```{R}
+df_train <- df_train %>%
+      left_join(param_1_freq_mapping)
+
+df_test <- df_test %>%
+      left_join(param_1_freq_mapping)
+```
+
+```{R}
+param_2_freq_mapping <- df_train %>%
+      count(param_2) %>%
+      union_all(
+            df_test %>%
+                  count(param_2)) %>%
+      group_by(param_2) %>%
+      summarize(num_param_2 = sum(n)) %>%
+      ungroup() %>% 
+      mutate(param_2_freq = num_param_2/sum(num_param_2)) %>%
+      select(param_2, param_2_freq)
+```
+
+```{R}
+df_train <- df_train %>%
+      left_join(param_2_freq_mapping)
+
+df_test <- df_test %>%
+      left_join(param_2_freq_mapping)
+```
+
+And finally *param_3*
+
+```{R}
+param_3_freq_mapping = df_train %>%
+      count(param_3) %>%
+      union_all(
+            df_test %>%
+                  count(param_3)) %>%
+      group_by(param_3) %>%
+      summarize(num_param_3 = sum(n)) %>%
+      ungroup() %>% 
+      mutate(param_3_freq = num_param_3/sum(num_param_3)) %>%
+      select(param_3, param_3_freq)
+```
+
+
+```{R}
+df_train <- df_train %>%
+      left_join(param_3_freq_mapping)
+
+df_test <- df_test %>%
+      left_join(param_3_freq_mapping)
+```
+
+## 3. Title and word count
+
+```{R}
+df_train <- df_train %>%
+      mutate(title_word_count = str_count(title, "\\w+"),
+             title_character_count = str_count(title),
+             description_word_count_log = log(1 + str_count(description, "\\w+")), 
+             description_character_count_log = log(1 + str_count(description)))
+```
+
+```{R}
+df_test <- df_test %>%
+      mutate(title_word_count = str_count(title, "\\w+"),
+             title_character_count = str_count(title),
+             description_word_count_log = log(1 + str_count(description, "\\w+")), 
+             description_character_count_log = log(1 + str_count(description)))
+```
+
+```{R}
+df_train %>%
+      arrange(description_character_count_log)
+```
+
+
+## 4. Presence/lack of presennce of values
+
+Here I'll just add some binary features to indicate if values are missing
+
+```{R}
+df_train <- df_train %>%
+      mutate(description_missing = is.na(description), 
+             price_mising = is.na(price),
+             image_missing = is.na(image),
+             param_1_missing = is.na(param_1), 
+             param_2_missing = is.na(param_2),
+             param_3_missing = is.na(param_3))
+```
+```{R}
+df_test <- df_test %>%
+      mutate(description_missing = is.na(description), 
+             price_mising = is.na(price),
+             image_missing = is.na(image),
+             param_1_missing = is.na(param_1), 
+             param_2_missing = is.na(param_2),
+             param_3_missing = is.na(param_3))
+```
+
+
+## 5. Tf-Idf of probability words
+
+
+## 5. Save data
+
+```{R}
+write_csv(df_train, "../data/basic_features/train.csv")
+write_csv(df_test, "../data/baBsic_features/test.csv") %>%
+      arrange(item_seq_number) %>%
+      select(activation_date, item_seq_number, days_since_previous_appearence)
+```
+
+
+```{R}
+df_train %>%
+      filter(user_id == "723cf5bd2a7d")
+```
+
+
