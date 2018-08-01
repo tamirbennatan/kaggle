@@ -1,0 +1,461 @@
+---
+title: "What's in that table? `train.csv`"
+output:
+  html_document:
+    messages: no
+    toc: true
+    toc_depth: 5
+    df_print: paged
+    fig_height: 7
+    fig_width: 11
+    code_folding: hide
+---
+
+## 0. Prerequesites
+
+### 0.0 Libraries
+
+```{R}
+library(dplyr)
+library(readr)
+library(reshape2)
+
+# string processing
+library(stringr)
+
+# viz
+library(ggplot2)
+library(corrplot)
+library(grid)
+
+
+```
+
+
+### 0.1 Helper functions
+
+```{R}
+# Define multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+## 1. First glance
+
+Here, I'll load the table, and take a first glance at the columns it contains. 
+
+Loading the data:
+
+```{R}
+# load the table
+train <- read_csv("../data/application_train.csv")
+```
+
+And taking a look a the column structure:
+
+```{R}
+# get
+str(train)
+```
+
+This table has 307511 observations of 122 features, of a wide variety. Many of the feature names are self explanitory and intuitively informative of a creditor's solvency (for example, `FLAG_OWN_CAR` is a binary feature which determines if the client owns a car). For other features, however, the meaning of the feature is unclear from the name, or the relevence to a creditor's solvency may not be obvious (e.g. `EXT_SOURCE_1`, `APARTMENTS_AVG`, `FLAG_DOCUMENT_2`.)
+
+## 2. Feature distributions and meanings
+
+The next order of business is to comb through each of the features in this table, and get a rough picture of their distributions. For the features whose meaning are not obvious from their names, I'll also try and get a better idea of what they encode. 
+
+This is a tedious process, and only a rough exploration of the features. In later sections I'll deeper into how these features relate, and in future notebooks I'll look into how the features in this table relate to the features of other tables. 
+
+
+### 2.1 `TARGET`
+
+The target column is a binary variable - presumably indicating whether or not the client defaulted on his/her loan. 
+
+```{R}
+train %>%
+      count(TARGET) %>%
+      rename(count = n) %>%
+      mutate(proportion = count/sum(count)) %>%
+      mutate(proportion = round(proportion,2)) %>%
+      ggplot(aes(x = TARGET, y = count, fill = TARGET, label = proportion)) + 
+      geom_col(show.legend = F) + 
+      coord_flip() + 
+      geom_text()
+```
+
+Around 8% of the responses are `1`, and the remaining 92% are `0`. 
+
+From this it's not clear if a positive of `TARGET` means that the client defaulted or not. We can look at the correlation between the target each of the numeric features to see if any features which are obviously related to increased/decreased risk of default are correlated to the target. 
+
+```{R}
+p1 <- train %>%
+      select_if(is.numeric) %>%
+      select(-SK_ID_CURR) %>%
+      cor(use = "pairwise.complete.obs") %>%
+      melt() %>%
+      filter(Var2 == "TARGET" & Var1 != "TARGET") %>%
+      rename(correlation = value, Variable = Var1) %>%
+      mutate(positive = ifelse(correlation > 0, TRUE, FALSE)) %>%
+      ggplot(aes(x = reorder(Variable, -correlation), y = correlation, fill = positive)) + 
+      geom_col(show.legend = FALSE) + 
+      coord_flip() + 
+      ggtitle("Correlation between variables and TARGET")
+
+p1
+```
+
+Here we can see that features usually associated with solvency like `DAYS_EMPLOYED` and `AMT_GOODS_PRICE` are negatively correlated with the target. This makes me believe that `TARGET = 1` means that the client defaulted on a loan, while `TARGET = 0` means that he did not. 
+
+This means that only 8% of the clients defaulted on their loans. This class imbalance will surely be a challenge in building a good classifier, and will be something we will have to consider carefully in the future. 
+
+### 2.2 `NAME_CONTRACT_TYPE`
+
+```{R}
+train %>%
+      count(NAME_CONTRACT_TYPE, sort = T) %>%
+      rename(count = n) %>%
+      mutate(proportion = count/sum(count))
+```
+
+There are only two types of loans in the training set - cash loans (which account for 90% of the training data) and revolving loans (the remaining 10%). 
+
+Revolving loans are arrangements in which the agreed loan amount can be withdrawn, repaid and redrawn again in number of times <a href="http://www.businessdictionary.com/definition/revolving-loan.html">(cite)</a>, while a cash loan presumably means that the loan amount is given up front, and the client is expected to repay it in full at the end of the loan period. 
+
+Revoling loans are therefore much more flexible. it's safe to assume that Home Credit is more discerning when deciding who is eligible for these types of loans 
+
+```{R}
+train %>%
+      group_by(NAME_CONTRACT_TYPE) %>%
+      summarize(proportion.default = mean(TARGET)) 
+```
+
+Indeed, applicants who recieve Revolving Loans have a lower default rate than those who get cash loans. 
+
+One can ask - which type of applicant is more likely to recieve a Revolving loan, and which is more likely to recieve a Cash loan? If indeed Home Credit only gives Revolving loans to the most trustworthy-looking clients, however, this question is probably intimately related to the client's ability to repay the loan.
+
+In fact, it may be the case that if a client recieves a Revolving loan, its because the models Home Credit developed predicts that the client is likely to repay their loan. Thus, using this feature may be a way of transfering the insight of Home Credit's models into our own models. 
+
+---
+
+Looking at how the various numeric features correlate with the target variable and with an applicant's likelyhood of getting a Revolving loan, we see some interesting similarities and differences (see graph below). 
+
+For example, high values of `AMT_CREDIT` and `AMT_ANNUITY` is negatively correlated with both `TARGET` and the likelyhood of getting a revolving loan, although the correlation is much stronger for the latter. However, having a positive value for the feature `FLAG_DOCUMENT_3` is much more negatively correlated with the likelyhood of getting a revolving loan than with the target feature (in fact, `FLAG_DOCUMENT_3` is positively correlated with`TARGET`); perhaps the presense/absense of this document is directly liked to a client's eligiblity to get a revolving loan. 
+
+
+
+```{R, fig.height = 14}
+p2 <- train %>%
+      mutate(revolving = ifelse(NAME_CONTRACT_TYPE == "Revolving loans", 1, 0)) %>%
+      select_if(is.numeric) %>%
+      select(-SK_ID_CURR) %>%
+      cor(use = "pairwise.complete.obs") %>%
+      melt() %>%
+      filter(Var2 == "revolving" & Var1 != "revolving") %>%
+      rename(correlation = value, Variable = Var1) %>%
+      mutate(positive = ifelse(correlation > 0, TRUE, FALSE)) %>%
+      ggplot(aes(x = reorder(Variable, -correlation), y = correlation, fill = positive)) + 
+      geom_col(show.legend = FALSE) + 
+      coord_flip() + 
+      ggtitle("Correlation between variables and REVOVLING")
+
+multiplot(p1,p2)
+```
+
+
+It's interesting how `AMT_ANNUITY` is so negativley correlated with recieving a revolving loan. Perhaps if a client has a large annuity contract with an insurance company, they are believed to be less liquid, and therefore less likely to repay a revolving loan? Any ideas? I'll have to look into this some more.
+
+### 2.3 `CODE_GENDER`
+
+```{R}
+train %>%
+      group_by(CODE_GENDER) %>%
+      summarize(count = n(),
+                mean.target = mean(TARGET)) %>%
+      ungroup() %>%
+      mutate(proportion = round(count/sum(count),3))
+
+```
+
+65% of applicants are female. Almost all of the remaining applicants are male - except for for applicants which selected some sort of "other" category. 
+
+Interestingly, on a global level, it 10% of males default on their loans, while 7% of females default on theirs. I find this type of disparity - which may seem easy to understand on the surface - very intersting to investigate further. Therefore, I'm going to to go on a bit of a tangent, and try to identify what is different between male and female candidates, in hopes of identifying why males seem more likely to default than women.
+---
+
+#### 2.3.0 Loan type
+
+There doesn't seem to be a difference in one's likelyhood to recieve a cash or revolving loan based on gender, and so this doesn't explain the diference in the gender's solvencies. 
+
+
+```{R}
+train %>%
+      group_by(CODE_GENDER, NAME_CONTRACT_TYPE) %>%
+      count() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = n/sum(n)) %>%
+      ungroup() %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = NAME_CONTRACT_TYPE, y = proportion, fill = CODE_GENDER)) + 
+      geom_col(position = "dodge") +
+      ggtitle("Likelyhood of Males/Females rcieving Cash/Revolving loans")
+```
+
+
+#### 2.3.1 Income inequality
+
+```{R}
+train %>%
+      ggplot(aes(x = AMT_INCOME_TOTAL)) + 
+      geom_density() + 
+      scale_x_log10() +
+      ggtitle("Income Density (log-scale)")
+```
+
+Income is generally very positively skewed - hence the log scale used above. With the exception of a few very rich applicants, most applicants earn less than $1,000,000 in total income. 
+
+Focusing on just these clients and spitting the income density, we see evidence of gender inequality in total income (see graph below). 
+
+
+
+```{R}
+p3 = train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      filter(AMT_INCOME_TOTAL <= 1e6) %>%
+      ggplot(aes(x = AMT_INCOME_TOTAL, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, show.legend = F) + 
+      scale_x_log10() +
+      ggtitle("Income Density (log-scale)")
+
+p4 = train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      filter(AMT_INCOME_TOTAL <= 1e6) %>%
+      ggplot(aes(x = AMT_INCOME_TOTAL, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, position = "fill") + 
+      scale_x_log10() +
+      ggtitle("Income Proportion (log-scale)") + 
+      geom_vline(xintercept = 150000, linetype = "dashed", color = "red")
+
+multiplot(p3, p4, cols = 2)
+```
+
+Men's salaries are shifted towards higher salaries, and the densities of men's and women's salaries have a similar shape. Men are more likely to recieve very high salaries: although men account for only 35% of the applicants in the training set, they hold 42% of positions that pay greater than \$150,000, 49% of positions that pay greater than \$250,000, and 55% of positions that pay greater than \$500,000. 
+
+This may be evidence that high paying leadership positions are generaly reserved for men - which is consistent with our knowledge of present inequalities in the workplace. 
+
+Although this phenomenon is interesting, it does not explain on its own why men seem to default on their loans more f frequently. 
+
+#### 2.3.2 More inequality? `AMT_GOODS_PRICE`, `AMT_CREDIT` and `AMT_ANNUITY`
+
+The distributions of the features `AMT_GOODS_PRICE`, `AMT_CREDIT` and `AMT_ANNUITY` are also positively skewed, and fairly mound shaped on the log-scale:
+
+```{R}
+p5 = train %>%
+      ggplot(aes(x = AMT_GOODS_PRICE)) + 
+      geom_density() +
+      scale_x_log10()  +
+      geom_vline(xintercept = 2.6e6, linetype = "dashed", color = "red") + 
+      ggtitle("Goods Price (log-scale)")
+
+p6 = train %>%
+      ggplot(aes(x = AMT_CREDIT)) + 
+      geom_density()  +
+      scale_x_log10() +
+      geom_vline(xintercept = 3e6, linetype = "dashed", color = "red") + 
+      ggtitle("Credit amount (log-scale)")
+
+p7 = train %>%
+      ggplot(aes(x = AMT_ANNUITY)) + 
+      geom_density()  +
+      scale_x_log10() +
+      geom_vline(xintercept = 1.3e5, linetype = "dashed", color = "red") +
+      geom_vline(xintercept = 3.5e3, linetype = "dashed", color = "red") +
+      ggtitle("Annuity amount (log-scale)")
+      
+multiplot(p5,p6,p7, cols = 1)
+```
+
+
+
+Keeping only those records within the red bands in the graphs above goods, and again splitting by gender, we see little evidence of gender inequality in the Goods prices and Credit amounts (first and second rows of graph below).
+
+When we look at the annuity amount, however, we see a similar phenomenon as the one observed in total income, split by gender; the shape of the annuity amounts - split by gender - are roughly the same, but the male annuities are slightly shifted towards higher values (third row in graph below). 
+
+```{R}
+p8 = train %>%
+      filter(AMT_GOODS_PRICE <= 2.6e6) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_GOODS_PRICE, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, show.legend = F) + 
+      scale_x_log10() +
+      ggtitle("Goods Price Density (log-scale)")
+
+p9 = train %>%
+      filter(AMT_GOODS_PRICE <= 2.6e6) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_GOODS_PRICE, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, position = "fill", show.legend = FALSE) + 
+      scale_x_log10() +
+      ggtitle("Goods Price Proportion (log-scale)") 
+
+p10 = train %>%
+      filter(AMT_CREDIT <= 3e6) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_CREDIT, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, show.legend = F) + 
+      scale_x_log10() +
+      ggtitle("Credit Density (log-scale)")
+
+p11 = train %>%
+      filter(AMT_CREDIT <= 3e6) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_CREDIT, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, position = "fill", show.legend = FALSE) + 
+      scale_x_log10() +
+      ggtitle("Credit Proportion (log-scale)")
+
+p12 = train %>%
+      filter(between(AMT_ANNUITY, 3.5e3, 1.3e5)) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_ANNUITY, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, show.legend = F) + 
+      scale_x_log10() +
+      ggtitle("Annuity amount Density (log-scale)")
+
+p13 = train %>%
+      filter(between(AMT_ANNUITY, 3.5e3, 1.3e5)) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = AMT_ANNUITY, fill = CODE_GENDER))  + 
+      geom_density(alpha = .6, position = "fill", show.legend = FALSE) + 
+      scale_x_log10() +
+      ggtitle("Annuity amount Proportion (log-scale)")
+
+multiplot(p8, p9, p10, p11, p12, p13,layout = matrix(c(1,2,3,4,5,6), ncol = 2,byrow = TRUE))
+```
+
+Again - although interesting - the pattern of higher annuity for men than women does not increase the apparent pattern of lower solvency of men than women. In fact - the overall correlation between annuity ammount and likelihood to default is negative (although close to zero in absolute value). 
+
+```{R}
+# number of bins to split continuous variables into
+bins = 20
+
+# convert a bin, in character format producted by `cut` function, to midpoint of bin. 
+# for example, "(12.50, 15.00]" is converted to 13.75. 
+bin2median <- function(bin.string){
+      bin.string = as.character(bin.string)
+      # Smallest value in bin
+      minValue = as.numeric(str_extract(bin.string, pattern =  "(?<=.)[0-9\\.]+(?=,)"))
+      # largest value in bin
+      maxValue = as.numeric(str_extract(bin.string, pattern =  "(?<=,)[0-9\\.]+(?=])"))
+      
+      return ((minValue + maxValue)/2)
+}
+
+bin2medVect = Vectorize(bin2median)
+```
+```{R}
+tmp = train %>%
+      select(AMT_INCOME_TOTAL, AMT_CREDIT, AMT_GOODS_PRICE, AMT_ANNUITY, CODE_GENDER, TARGET)  %>%
+      mutate(income.log = log(AMT_INCOME_TOTAL), 
+             credit.log = log(AMT_CREDIT), 
+             goods.log = log(AMT_GOODS_PRICE), 
+             annuity.log = log(AMT_ANNUITY)) %>%
+      mutate(income.bin = cut(income.log, bins), 
+             credit.bin = cut(credit.log, bins),
+             goods.bin = cut(goods.log, bins), 
+             annuity.bin = cut(annuity.log, bins))
+             
+```
+```{R}
+p14 <- tmp %>%
+      group_by(income.bin, credit.bin) %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      mutate(income.med = bin2median(income.bin), 
+             credit.med = bin2median(credit.bin)) %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = income.med, y = credit.med, fill = target.mean, alpha = count)) + 
+      geom_tile() + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Income and Credit bins, versus target")
+```
+
+```{R}
+p15 <- tmp %>%
+      group_by(income.bin, credit.bin, CODE_GENDER) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      mutate(income.med = bin2median(income.bin), 
+             credit.med = bin2median(credit.bin)) %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = income.med, y = credit.med, fill = target.mean, alpha = count)) + 
+      geom_tile(show.legend = F) + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Income and Credit bins, versus target") + 
+      facet_wrap(~CODE_GENDER)
+```
+
+```{R}
+multiplot(p14, p15, cols = 1)
+```
+
+
+```{R}
+tmp %>%
+      ggplot(aes(x = income.log, y = credit.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = F)
+      
+```
+
+
+
+
+
+
+
+
+

@@ -798,6 +798,17 @@ train %>%
       ggtitle("Proportion of `image_top_1` by parent category")
 ```
 
+```{R}
+```{R}
+train %>%
+      count(parent_category_name, image_top_1) %>%
+      ggplot(aes(x = image_top_1, y = n, group = parent_category_name, fill = parent_category_name)) +
+      geom_area(position = "fill") +
+      ggtitle("Proportion of `image_top_1` by parent category")
+```
+```
+
+
 See how the values of *image_top_1* are "clustered" amongst ads of the same category? This is a relationship. For demonstration, contrast this with the distribution of *image_top_1* amongst different geographical regions:
 
 
