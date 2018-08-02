@@ -16,17 +16,23 @@ output:
 ### 0.0 Libraries
 
 ```{R}
+# data manipulations
 library(dplyr)
 library(readr)
 library(reshape2)
+library(tidyr)
 
 # string processing
 library(stringr)
+
+# mapping functions
+library(purrr)
 
 # viz
 library(ggplot2)
 library(corrplot)
 library(grid)
+library(ggridges)
 
 
 ```
@@ -220,6 +226,7 @@ train %>%
 65% of applicants are female. Almost all of the remaining applicants are male - except for for applicants which selected some sort of "other" category. 
 
 Interestingly, on a global level, it 10% of males default on their loans, while 7% of females default on theirs. I find this type of disparity - which may seem easy to understand on the surface - very intersting to investigate further. Therefore, I'm going to to go on a bit of a tangent, and try to identify what is different between male and female candidates, in hopes of identifying why males seem more likely to default than women.
+
 ---
 
 #### 2.3.0 Loan type
@@ -374,23 +381,23 @@ multiplot(p8, p9, p10, p11, p12, p13,layout = matrix(c(1,2,3,4,5,6), ncol = 2,by
 
 Again - although interesting - the pattern of higher annuity for men than women does not increase the apparent pattern of lower solvency of men than women. In fact - the overall correlation between annuity ammount and likelihood to default is negative (although close to zero in absolute value). 
 
+---
+
+We see some interesting inequalities between men and women with regard to Income, Credit, Annuity, and Goods. Perhaps the interactions distributions of these two features - and how they affect likelihood to default differently for men and women - may give us insight into why men default on their loans more often. 
+
+Below are six plots, one for each of the pairs features in {`AMT_INCOME_TOTAL`, `AMT_GOODS_PRICE`, `AMT_CREDIT`, `AMT_ANNUITY`}. The first row of each plot shows a 2D density plot of the pair of features, split by gender. The heat maps (tile charts) in the second rows of each figure are more involved: they are created using the following procedure:
+
+- Split each (log) feature into 20 equally sized bins. 
+- Compute the number of records that fall into each pair of bins, for the two features. This will correspond with the opacity of the final tiles. 
+- Compute the average default rate within the bins. This will correspond with the color of the tiles. 
+- Split the heatmap by gender. 
+
+
+I'm hoping to see one of two interesting things in these visualizations: first, it would be intersting to observe differences in the 2D distributions of the features for men and women. Even better yet - I'm looking to see if these differences in distributions also correspond to areas of very different default rates - for example, if women tend to have low income but high annuity more frequently than men, and this charactaristic is also associated with low default rates (not sure if this is true yet...) 
+
 ```{R}
 # number of bins to split continuous variables into
 bins = 20
-
-# convert a bin, in character format producted by `cut` function, to midpoint of bin. 
-# for example, "(12.50, 15.00]" is converted to 13.75. 
-bin2median <- function(bin.string){
-      bin.string = as.character(bin.string)
-      # Smallest value in bin
-      minValue = as.numeric(str_extract(bin.string, pattern =  "(?<=.)[0-9\\.]+(?=,)"))
-      # largest value in bin
-      maxValue = as.numeric(str_extract(bin.string, pattern =  "(?<=,)[0-9\\.]+(?=])"))
-      
-      return ((minValue + maxValue)/2)
-}
-
-bin2medVect = Vectorize(bin2median)
 ```
 ```{R}
 tmp = train %>%
@@ -405,51 +412,478 @@ tmp = train %>%
              annuity.bin = cut(annuity.log, bins))
              
 ```
-```{R}
-p14 <- tmp %>%
-      group_by(income.bin, credit.bin) %>%
-      summarize(target.mean = mean(TARGET), 
-                count = n()) %>%
-      ungroup() %>%
-      mutate(income.med = bin2median(income.bin), 
-             credit.med = bin2median(credit.bin)) %>%
-      filter(count > 1) %>%
-      ggplot(aes(x = income.med, y = credit.med, fill = target.mean, alpha = count)) + 
-      geom_tile() + 
-      scale_fill_distiller(palette = "Spectral") + 
-      scale_alpha(range = c(0.2, 1)) + 
-      ggtitle("Income and Credit bins, versus target")
-```
+
+###### Income vs Credit
 
 ```{R}
+p14 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = income.log, y = credit.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) +
+      ggtitle("Densities over Income and Credit")
+
+
 p15 <- tmp %>%
       group_by(income.bin, credit.bin, CODE_GENDER) %>%
       filter(CODE_GENDER != "XNA") %>%
       summarize(target.mean = mean(TARGET), 
                 count = n()) %>%
       ungroup() %>%
-      mutate(income.med = bin2median(income.bin), 
-             credit.med = bin2median(credit.bin)) %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
       filter(count > 1) %>%
-      ggplot(aes(x = income.med, y = credit.med, fill = target.mean, alpha = count)) + 
-      geom_tile(show.legend = F) + 
+      ggplot(aes(x = income.bin, y = credit.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile() + 
       scale_fill_distiller(palette = "Spectral") + 
       scale_alpha(range = c(0.2, 1)) + 
       ggtitle("Income and Credit bins, versus target") + 
-      facet_wrap(~CODE_GENDER)
-```
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-```{R}
 multiplot(p14, p15, cols = 1)
 ```
 
 
+Again, we can see that men tend to have higher income and slightly higher credit than women. In terms of the higher default rate, I don't see a clear indication that high credit and high income leads to high default rate - it looks like men have higher default rates evenly across the distributions of income and credit. 
+
+###### Income vs Annuity
+
+
 ```{R}
-tmp %>%
-      ggplot(aes(x = income.log, y = credit.log)) + 
-      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = F)
+p16 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = income.log, y = annuity.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) +
+      ggtitle("Densities over Income and Annuity")
+
+
+p17 <- tmp %>%
+      group_by(income.bin, annuity.bin, CODE_GENDER) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = income.bin, y = annuity.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile() + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Income and Annuity bins, versus target") + 
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+multiplot(p16, p17, cols = 1)
+
+```
+
+
+Again, we can see that men clearly tend to have higher annuity and income; the "hot" spots in the density plot in the first row tend to be shifted up and right for men compared to women. The higher density in this corner, however, does not seem to correspond with pockets of higher default rates. 
+
+
+###### Income vs Goods
+
+
+```{R}
+p18 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = income.log, y = goods.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) +
+      ggtitle("Densities over Income and Goods")
+
+
+p19 <- tmp %>%
+      group_by(income.bin, goods.bin, CODE_GENDER) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = income.bin, y = goods.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile(show.legend = F) + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Income and Goods bins, versus target") + 
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+multiplot(p18, p19, cols = 1)
+```
+
+Nothing particularly exciting here. 
+
+
+###### Credit vs Annuity
+
+
+```{R}
+p20 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = credit.log, y = annuity.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) +
+      ggtitle("Densities over Credit and Annuity")
+
+
+p21 <- tmp %>%
+      group_by(credit.bin, annuity.bin, CODE_GENDER) %>%
+      filter(CODE_GENDER != "XNA") %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = credit.bin, y = annuity.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile() + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Credit and Annuity bins, versus target") + 
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+multiplot(p20, p21, cols = 1)
+
+```
+
+Nothing revealing about the differences in default rate relating to densities here. It is interesting that credit and annuity are so highly correlated, however. We'll look into this later. 
+
+
+###### Credit vs Goods
+
+```{R}
+p22 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = credit.log, y = goods.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) +
+      ggtitle("Densities over Credit and Goods")
+
+
+p23 <- tmp %>%
+      group_by(credit.bin, goods.bin, CODE_GENDER) %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = credit.bin, y = goods.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile() + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Credit and Goods bins, versus target") + 
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+multiplot(p22, p23, cols = 1)
+```
+
+The densities of credit and goods prices are very similar for men and women. Again, these two features are very highly correlated - more later. 
+
+
+###### Annuity vs Goods
+
+
+```{R}
+p24 <- tmp %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = annuity.log, y = goods.log)) + 
+      stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = FALSE) + 
+      facet_wrap(~CODE_GENDER) + 
+      ggtitle("Densities over Annuity and Goods")
+
+
+p25 <- tmp %>%
+      group_by(annuity.bin, goods.bin, CODE_GENDER) %>%
+      summarize(target.mean = mean(TARGET), 
+                count = n()) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      filter(count > 1) %>%
+      ggplot(aes(x = annuity.bin, y = goods.bin, fill = target.mean, alpha = proportion)) + 
+      geom_tile(show.legend = F) + 
+      scale_fill_distiller(palette = "Spectral") + 
+      scale_alpha(range = c(0.2, 1)) + 
+      ggtitle("Annuity and Goods bins, versus target") + 
+      facet_wrap(~CODE_GENDER) + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+multiplot(p24, p25, cols = 1)
+```
+
+Here, we notice that its more common for men to have very low Goods price, but low/medium annuity. From the heatmaps, it seems like low goods prices and annuity tends to lead to higher default rates. Very few applications fall under this category, however, so this evidence is very shakey. 
+
+
+--- 
+
+Unfortunately, just looking at income, annuity, credit, and goods prices doesnt reveal what it is about men that leads to overall higher default rates. To get to the bottom of it, I'll need to dig a bit deeper into what's different between men and women in this dataset. 
+
+
+#### 2.3.4 Occupation differences between men and women
+
+One potential explanation for the difference between male and female solvency could be differences in occupations frequently occupied by males and females, and how occupations relate to solvency. This idea is the topic of this subsection. 
+
+---
+
+Looking at the distribution of males and females in the various occupations (below), we see that the majority of applicants occupy one of the positions **Working, State Servant, Pensioner**, or **Commercial Associate** (top left). I'll refer to these occupations as the "**big four**" occupations. 
+
+People who are either on Maternity leave or unemployed have a much higher likelyhood of defaulting on their debts (top right), though these occupations constitute a very small minority of the applicants. Of the big four occupations, the default rate hovers around 8%, though those of the occupation **working** default at a slightly higher rate, and those with the occupations **state servant** and **pensioner** default at a lower rate. 
+
+Although 60% of all applicants of the **Working** occupation are female (bottom left), 60% of male applicants are of this occupation, while only 47% of female applicants are of this occupation (bottom right). In other words, although most "workers" are female, a larger proportion of males are workers than that of females. Since people of the **working** occupation have a slightly higher default rate, this may explain why males have a higher global default rate. <ul>*Although*</ul>, we cannot know in which direction the causation lies (is male default rate higher because most males are workers, or are worker default rates high because many workers are male???)
+
+Along this same logic: A larger proportion of females are state servants and pensioners, compared to the proportion of males of these occupations. Since these occupations have slightly lower default rates, this could explain why females have lower default rates (same warning as before.)
+
+
+```{R, fig.height = 10, figh.width = 12}
+p26 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      count(NAME_INCOME_TYPE, CODE_GENDER) %>%
+      rename(count = n) %>%
+      ggplot(aes(x = NAME_INCOME_TYPE, y = count, fill = CODE_GENDER)) + 
+      geom_col(position = "dodge") + 
+      coord_flip() + 
+      ggtitle("Employment type - global count")
+
+p27 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      count(NAME_INCOME_TYPE, CODE_GENDER)  %>%
+      rename(count = n) %>%
+      group_by(NAME_INCOME_TYPE) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      mutate(label = paste(round(proportion*100,3), "%")) %>%
+      ggplot(aes(x = NAME_INCOME_TYPE, y = count, fill = CODE_GENDER, label = label)) +
+      geom_col(position = "fill", show.legend = F) + 
+      coord_flip() + 
+      geom_text(position = position_fill()) + 
+      ggtitle("Employ. Type. Percentage by gender")
+
+
+p28 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      count(NAME_INCOME_TYPE, CODE_GENDER)  %>%
+      rename(count = n) %>%
+      group_by(CODE_GENDER) %>%
+      mutate(proportion = count/sum(count)) %>%
+      ungroup() %>%
+      mutate(proportion = round(proportion, 3)) %>%
+      mutate(label = paste(proportion*100, "%")) %>%
+      ggplot(aes(x = NAME_INCOME_TYPE, y = proportion, fill = CODE_GENDER, label = label)) +
+      geom_col(position = "dodge", show.legend = F) + 
+      coord_flip() + 
+      geom_text(position = position_dodge(width = 0.9)) + 
+      ggtitle("Within gender emply. type perc.")
+
+p29 <- train %>%
+      count(NAME_INCOME_TYPE, TARGET) %>% 
+      mutate(TARGET = as.factor(TARGET)) %>%
+      ggplot(aes(x = NAME_INCOME_TYPE, y = n, fill = TARGET)) + 
+      geom_col(position = "fill") + 
+      coord_flip() + 
+      scale_fill_discrete( h = c(50,1000)) + 
+      geom_hline(yintercept = .08, linetype = "dashed")
+
+multiplot(p26, p29, p27, p28, layout = matrix(c(1,1,2,3,4,4), byrow = T, nrow = 2))
       
 ```
+
+```{R}
+train %>%
+      group_by(OCCUPATION_TYPE) %>%
+      summarize(num = n(), 
+                target_mean = mean(TARGET)) %>%
+      melt(id.vars = c("OCCUPATION_TYPE")) %>%
+      ggplot(aes(x = reorder(OCCUPATION_TYPE, value, FUN = min), y = value, fill = variable)) + 
+      geom_col(show.legend = F) +
+      coord_flip() + 
+      facet_wrap(~variable, scales = "free_x") +
+      xlab("Occupation Type") + 
+      geom_hline(yintercept = .08, linetype = "dashed")
+```
+
+
+```{R}
+train %>%
+      group_by(ORGANIZATION_TYPE) %>%
+      summarize(num = n(), 
+                target_mean = mean(TARGET)) %>%
+      melt(id.vars = c("ORGANIZATION_TYPE")) %>%
+      ggplot(aes(x = reorder(ORGANIZATION_TYPE, value, FUN = min), y = value, fill = variable)) + 
+      geom_col(show.legend = F) +
+      coord_flip() + 
+      facet_wrap(~variable, scales = "free_x") +
+      xlab("ORGANIZATION_TYPE Type") + 
+      geom_hline(yintercept = .08, linetype = "dashed")
+```
+---
+
+Looking at the number of days people have worked (below), we see two weird properties. First, the number of days are often negative (perhaps to encode the number of days "until" the person started working), and that may people have worked for an unreasonable number of days (over 300,000 - or one thousand years). 
+
+
+
+```{R}
+train %>%
+      ggplot(aes(x = DAYS_EMPLOYED)) +
+      geom_density()
+```
+
+The first thing I'll do is create an additional feature, called `years_employed`, which will replace unusual values of `DAYS_EMPLOYED` with `NA`, and convert the values to positive values, in terms of years. I'll also add a column for the age of applicants, in terms of years, by multiplying `DAYS_BIRTH` by $\frac{-1}{365}$.
+
+```{R}
+# Add a column for the number of years since beginning employement.
+train <- train %>%
+      mutate(years_employed = ifelse(DAYS_EMPLOYED > 3e5, NA, DAYS_EMPLOYED*-1/365))
+
+# Add column for age
+train <- train %>% 
+      mutate(years_birth = DAYS_BIRTH * -1/365)
+
+```
+```{R}
+train %>%
+      ggplot(aes(x = years_employed)) +
+      geom_density() + 
+      ggtitle("Distribution of years employed (reasonable values only)")
+```
+
+Most people have been working between 0 and 10 years, with the majority of the weight towards very little time. Some people have worked up to 50 years. 
+
+18% of records (55374 out of 307511) contain unreasonable values or `DAYS_EMPLOYED`. These 55374 records are distributed entirely amongst those applicants with the occupation **Pensioner** and **Unemployed** (below) - presumably because it doesn't make sense to count the number of days someone is ``employed" if they are unemplyed or retired. 
+
+
+```{R}
+train %>%
+      mutate(isna = is.na(years_employed)) %>%
+      group_by(NAME_INCOME_TYPE) %>%
+      summarise(num_missing = sum(isna), 
+                num_records = n()) %>%
+      mutate(percent_missing = num_missing/num_records)
+```
+
+---
+
+Below we can see male applicants tend to have worked for less time than women applicants. Furthermore, male applicants tend to be much youger than women applicants. 
+
+```{R}
+p30 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = years_employed, fill = CODE_GENDER)) + 
+      geom_density(alpha = .7, show.legend = F) +
+      ggtitle("Densities of years worked, by gender")
+
+p31 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = years_employed, fill = CODE_GENDER)) +
+      geom_density(position = "fill")
+
+p32 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = years_birth, fill = CODE_GENDER)) +
+      geom_density(alpha = .7, show.legend = F) + 
+      ggtitle("Applicant age, by gender")
+
+p33 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      ggplot(aes(x = years_birth, fill = CODE_GENDER)) +
+      geom_density( position = "fill")
+
+multiplot(p30,p31,p32,p33, layout = matrix(c(1,2,3,4), byrow = T, ncol = 2))
+```
+
+---
+
+Next, I'll look into the relationships between career length, age, loan charactaristics and default rate. 
+
+Surprisingly, on a global level, age and number of years an applicant has worked uncorrelated to the probability of defaulting, as well as income, credit, annuity, and goods price. Again, we observe a weak positive correlation between income and credit, goods price, and annuity. 
+
+
+```{R}
+train %>%
+      select(TARGET, years_employed, years_birth, AMT_INCOME_TOTAL, AMT_CREDIT, AMT_GOODS_PRICE, AMT_ANNUITY) %>%
+      cor(use = "pairwise.complete.obs") %>%
+      melt() %>%
+      mutate(correlation = round(value, 3)) %>%
+      ggplot(aes(x = Var1, y = Var2, fill = correlation, label = correlation)) + 
+      geom_tile() + 
+      geom_text(size = 3) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      scale_fill_distiller(palette = "Spectral", limits = c(-1,1))
+```
+
+When we look at this same correlation plot, split by the occupation (for the ``big four" occupations only), we see very similar correlation patterns as for the global correlation. 
+
+There are a few features in these correlation plots which are different when we split by occupation, however, including:
+
+- Age and years working are somewhat strongly positively correlated, _except_ for applicants of the occupation *Pensioner*. 
+- Although For Pensioners, age is not especially strongly correlated with income, annuity or credit, 
+
+```{R}
+
+train %>% 
+      select(NAME_INCOME_TYPE,TARGET, years_employed,years_birth, AMT_INCOME_TOTAL, AMT_CREDIT, AMT_GOODS_PRICE, AMT_ANNUITY) %>%
+      filter(NAME_INCOME_TYPE %in% c("Commercial associate", "Pensioner", "State servant", "Working")) %>%
+      group_by(NAME_INCOME_TYPE) %>%
+      nest() %>%
+      mutate(corrmat =  map(.x = data, .f = function(x) cor(x, use = "pairwise.complete.obs") %>%
+                                  melt())) %>%
+      select(-data) %>%
+      unnest() %>%
+      mutate(correlation = round(value,3)) %>%
+      ggplot(aes(x = Var1, y = Var2, fill = correlation, label = correlation)) + 
+      geom_tile() + 
+      facet_wrap(~NAME_INCOME_TYPE) + 
+      scale_fill_distiller(palette = "Spectral", limits = c(-1,1)) + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      geom_text(size= 2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
