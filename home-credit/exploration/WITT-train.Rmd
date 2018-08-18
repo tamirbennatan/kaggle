@@ -33,6 +33,7 @@ library(ggplot2)
 library(corrplot)
 library(grid)
 library(ggridges)
+library(GGally)
 
 
 ```
@@ -636,9 +637,11 @@ Here, we notice that its more common for men to have very low Goods price, but l
 Unfortunately, just looking at income, annuity, credit, and goods prices doesnt reveal what it is about men that leads to overall higher default rates. To get to the bottom of it, I'll need to dig a bit deeper into what's different between men and women in this dataset. 
 
 
-#### 2.3.4 Occupation differences between men and women
+#### 2.3.4 Getting to the bottom of it: occupation differences between men and women
 
-One potential explanation for the difference between male and female solvency could be differences in occupations frequently occupied by males and females, and how occupations relate to solvency. This idea is the topic of this subsection. 
+One potential explanation for the difference between male and female solvency could be differences in occupations frequently occupied by males and females, and how occupations relate to solvency.
+
+This idea is the topic of this subsection. In it we not only come to a potential explanation as to why men tend to default more frequently than women, but also explore features regarding the occupation of applicants such as `NAME_INCOME_TYPE` and `OCCUPATION_TYPE`.
 
 ---
 
@@ -704,18 +707,69 @@ multiplot(p26, p29, p27, p28, layout = matrix(c(1,1,2,3,4,4), byrow = T, nrow = 
       
 ```
 
+
+Beyond the income type `NAME_INCOME_TYPE`, another interesting feature is the occupation type, `OCCUPATION_TYPE`, and the differences in the occupation makeup between genders (below). 
+
+Applicants with certain occupations tend to have a higher default rate than others (top right). Furthermore, the distribution of applicants within a certain gender might explain why men have a higher default rate than women on average. 
+
+One of the occupations that simultaneouly has one the highest average default rate and frequency is *Laborers*, with an average default rate of around 11% (top right), and over 10% for both men and women with this occupation (bottom right). Around 31% of men have this occupation, while only 11% of women have this occupation. Similarly, around 16% of men are drivers - an occupation with a default rate of over 10% for men - and less than 5% of women are women. 
+
+On the other hand, a larger percentage of women occupy low default rate occupations than man - 11% of women are of occupation *Core Staff* - an occupation with default rates less than 8%, while only ~6% of men are Core Staff. ~5% of women are accountants - an occupation with default rates of around 6% - while only around 1% of men are accountants. 
+This disparity in the proportion of men and women who occupy different jobs, and the fact that some occupations corresond to higher default rates than others, may finally lead us to our explanation as to why men have a higher default rate than women in this dataset.
+
+It also leads us to an additional insight - not only are the gender and occupation of an applicant important features to consider, but also their interaction. For some occupations, such as laborers, drivers and medicine staff, the average default rates are rather different for male and female applicants of that occupation. 
+
+
 ```{R}
-train %>%
+# order the bars in the below bar charts by the frequency of occupations
+occ_order = train %>% 
+      count(OCCUPATION_TYPE) %>%
+      arrange(n) %>%
+      .$OCCUPATION_TYPE
+
+p34 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
       group_by(OCCUPATION_TYPE) %>%
-      summarize(num = n(), 
-                target_mean = mean(TARGET)) %>%
-      melt(id.vars = c("OCCUPATION_TYPE")) %>%
-      ggplot(aes(x = reorder(OCCUPATION_TYPE, value, FUN = min), y = value, fill = variable)) + 
-      geom_col(show.legend = F) +
+      summarise(mean_target = mean(TARGET)) %>%
+      ggplot(aes(x = OCCUPATION_TYPE, y = mean_target)) + 
+      geom_col() +
+      scale_x_discrete(limits=occ_order) + 
       coord_flip() + 
-      facet_wrap(~variable, scales = "free_x") +
-      xlab("Occupation Type") + 
+      ggtitle("Average default rate by occupation") + 
       geom_hline(yintercept = .08, linetype = "dashed")
+
+p35 <- train %>%
+      filter(CODE_GENDER != "XNA") %>%
+      group_by(OCCUPATION_TYPE, CODE_GENDER)  %>% 
+      summarise(target_mean = mean(TARGET)) %>%
+      ggplot(aes(x = OCCUPATION_TYPE, y = target_mean, fill = CODE_GENDER)) + 
+      geom_col(position = "dodge") + 
+      coord_flip() + 
+      scale_x_discrete(limits=occ_order) + 
+      ggtitle("Average default rate by occupation/gender") + 
+      geom_hline(yintercept = .08, linetype = "dashed")
+
+p36 <- train %>%  
+      filter(CODE_GENDER != "XNA") %>%
+      count(OCCUPATION_TYPE) %>%
+      ggplot(aes(x = OCCUPATION_TYPE, y = n )) + 
+      geom_col() + 
+      coord_flip() + 
+      scale_x_discrete(limits=occ_order) + 
+      ggtitle("Occupation Frequency")
+
+p37 <- train %>%  
+      filter(CODE_GENDER != "XNA") %>%
+      count(OCCUPATION_TYPE, CODE_GENDER) %>%
+      group_by(CODE_GENDER) %>%
+      mutate(gender_proportion = n/sum(n)) %>%
+      ggplot(aes(x = OCCUPATION_TYPE, y = gender_proportion , fill = CODE_GENDER)) + 
+      geom_col(show.legend = F, position = "dodge") + 
+      coord_flip() + 
+      scale_x_discrete(limits=occ_order) + 
+      ggtitle("Occupation proportion by gender")
+
+multiplot(p36, p34,p37, p35, layout = matrix(c(1,2,3,4), nrow = 2, byrow = T))
 ```
 
 
@@ -731,8 +785,111 @@ train %>%
       facet_wrap(~variable, scales = "free_x") +
       xlab("ORGANIZATION_TYPE Type") + 
       geom_hline(yintercept = .08, linetype = "dashed")
+
 ```
----
+
+
+### 2.4 Relationship between income, goods credit and annuity
+
+In the previous section, we looked at how people of different genders and occupations vary in terms of income `AMT_INCOME_TOTAL`, and the properties of their loan, including the loan amount `AMT_CREDIT`, the dollar value of the goods they are purchasing with the loan `AMT_GOODS_PRICE`, and the annuity price, `AMT_ANNUITY`. 
+
+We did not, however, look into how the interactions of these loan properties affects an applicants likelihood of paying back his/her loan. This will be the topic of this subsection. 
+
+
+#### 2.4.1 Ratios relevant to application
+
+First, I'll create a series of columns of the ratios of each pair of columns in `AMT_INCOME_TOTAL`, `AMT_ANNUITY`, `AMT_GOODS_PRICE`, `AMT_CREDIT`.
+
+```{R}
+train <- train %>%
+      mutate(credit_income_rat = AMT_CREDIT/AMT_INCOME_TOTAL, 
+             annuity_income_rat = AMT_ANNUITY/AMT_INCOME_TOTAL, 
+             goods_income_rat = AMT_GOODS_PRICE/AMT_INCOME_TOTAL, 
+             goods_credit_rat = AMT_GOODS_PRICE/AMT_CREDIT, 
+             annuity_credit_rat = AMT_ANNUITY/AMT_CREDIT, 
+             goods_annuity_rat = AMT_GOODS_PRICE/AMT_ANNUITY)
+```
+
+At first glance, none of these ratios are strongly correlated with `TARGET`. Many of them are highly correlated with each other, but this is just because credit, goods price, and annuity are so strongly correlated to each other. 
+
+```{R}
+train %>%
+      select(TARGET, credit_income_rat, annuity_income_rat, 
+             goods_income_rat, goods_credit_rat, 
+             annuity_credit_rat, goods_annuity_rat) %>%
+      ggpairs()
+
+```
+
+
+
+Of the univariate distributions of these 
+
+
+```{R}
+p1 <- train %>%
+      ggplot(aes(x = goods_credit_rat)) + 
+      geom_density() + 
+      geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+      ggtitle("Goods over Credit")
+
+p2 <- train %>%
+      ggplot(aes(x = goods_income_rat)) + 
+      geom_density() + 
+      geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+      ggtitle("Goods over Income")
+
+p3 <- train %>%
+      ggplot(aes(x = credit_income_rat)) + 
+      geom_density() + 
+      geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+      ggtitle("Credit over Income") 
+
+p4 <- train %>%
+      ggplot(aes(x = annuity_income_rat)) + 
+      geom_density() + 
+      geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+      ggtitle("Annuity over Income") 
+
+multiplot(p1,p2,p3,p4, cols = 2)
+
+```
+
+
+```{R}
+goods_income_med = train$goods_income_rat %>% median(na.rm = T)
+goods_income_std = train$goods_income_rat %>% var(na.rm = T) %>% sqrt()
+
+train %>%
+      mutate(std_dist = (goods_income_rat - goods_income_med)/goods_income_std) %>%
+      mutate(dist_group = round(std_dist*3/max(std_dist, na.rm = T))) %>%
+      mutate(dist_group = as.factor(dist_group)) %>%
+      ggplot(aes(x = goods_income_rat, fill = dist_group)) + 
+      geom_histogram() + 
+      geom_vline(xintercept = goods_income_med, linetype = "dashed")
+
+```
+
+
+```{R}
+train %>%
+      filter(goods_income_rat <= 1) %>%
+      summarise(target_mean = mean(TARGET))
+
+```
+
+
+
+
+```{R}
+train %>%
+      ggplot(aes(x = annuity_credit_rat)) + 
+      geom_density()
+```
+
+
+### 2.5 `DAYS_EMPLOYED`
+
 
 Looking at the number of days people have worked (below), we see two weird properties. First, the number of days are often negative (perhaps to encode the number of days "until" the person started working), and that may people have worked for an unreasonable number of days (over 300,000 - or one thousand years). 
 
@@ -776,6 +933,8 @@ train %>%
                 num_records = n()) %>%
       mutate(percent_missing = num_missing/num_records)
 ```
+
+
 
 ---
 
